@@ -141,6 +141,15 @@ class App:
                 shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _expand(raw: Any) -> Path | None:
+    """`~`-expanded path, or None for input expanduser rejects (unknown
+    user, NUL byte) — such a request is a 400, not a dropped connection."""
+    try:
+        return Path(str(raw)).expanduser()
+    except (RuntimeError, ValueError):
+        return None
+
+
 def choose_folder(initial: Path) -> Path | None:
     """Show the macOS folder picker; None when the user cancels."""
     start = initial
@@ -218,8 +227,8 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
                     return self._json(HTTPStatus.BAD_REQUEST, {"error": "Nieznany tryb eksportu."})
                 folder = None
                 if mode == "folder" and body.get("folder"):
-                    folder = Path(str(body["folder"])).expanduser()
-                    if not folder.is_absolute():
+                    folder = _expand(body["folder"])
+                    if folder is None or not folder.is_absolute():
                         return self._json(HTTPStatus.BAD_REQUEST, {"error": "Podaj pełną ścieżkę folderu."})
                 if not app.start_export([str(i) for i in ids], mode, folder):
                     return self._json(HTTPStatus.CONFLICT,
@@ -231,6 +240,11 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
             if path == "/api/choose-folder":
                 return self._choose_folder()
             if path == "/api/shutdown":
+                # Killing the export thread mid-run would leave a partial folder
+                # or an orphaned temp dir; the request may come from another tab.
+                if app.job.snapshot()["running"]:
+                    return self._json(HTTPStatus.CONFLICT,
+                                      {"error": "Trwa eksport — zakończ aplikację, gdy się skończy."})
                 self._json(HTTPStatus.OK, {"ok": True})
                 return app.request_shutdown()
             self._json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
@@ -250,7 +264,7 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
             body = self._read_json()
             initial = body.get("current") if isinstance(body, dict) else None
             try:
-                chosen = choose_folder(Path(str(initial)).expanduser() if initial else app.out_root)
+                chosen = choose_folder((initial and _expand(initial)) or app.out_root)
             except (OSError, subprocess.SubprocessError) as exc:
                 return self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"Nie udało się otworzyć okna: {exc}"})
             self._json(HTTPStatus.OK, {"path": str(chosen) if chosen else None})

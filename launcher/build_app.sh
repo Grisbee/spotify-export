@@ -10,7 +10,12 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PROJECT="$(dirname "$HERE")"
 # Finder starts apps with a minimal PATH, so the interpreter path is fixed now.
-PYTHON="${PYTHON:-$(command -v python3)}"
+# Resolved through sys.executable so a pyenv/asdf shim is replaced by the real
+# interpreter: under Finder a shim has no shell context to pick a version.
+if ! PYTHON="$("${PYTHON:-python3}" -c 'import sys; print(sys.executable)' 2>/dev/null)"; then
+  echo "Nie znaleziono python3 — podaj go przez PYTHON=/ścieżka/do/python3" >&2
+  exit 1
+fi
 DEST="${1:-$PROJECT/dist}"
 APP="$DEST/Eksport playlist.app"
 PORT=8888
@@ -49,8 +54,9 @@ PLIST
 URL="http://127.0.0.1:$PORT/"
 LOG="$HOME/Library/Logs/spotify-export.log"
 
-# Already running: just bring the page up.
-if curl -s -o /dev/null --max-time 2 "$URL"; then
+# Already running: just bring the page up. Checks a response only this app
+# gives, so another service on the port isn't mistaken for it.
+if curl -fs --max-time 2 "${URL}api/config" | grep -q can_choose_folder; then
   open "$URL"
   exit 0
 fi
