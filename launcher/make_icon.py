@@ -15,7 +15,7 @@ from PIL import Image, ImageDraw
 HERE = Path(__file__).resolve().parent
 SIZE = 1024
 SCALE = 4  # draw oversized, then downsample for smooth edges
-TOP, BOTTOM = (91, 63, 217), (19, 168, 158)  # violet → teal
+TOP, BOTTOM = (46, 184, 118), (14, 120, 104)  # light green → deep teal-green
 WHITE = (255, 255, 255, 255)
 
 
