@@ -207,8 +207,12 @@ def _best_image(images: list[dict[str, Any]] | None) -> str | None:
     images = [img for img in images if isinstance(img, dict) and img.get("url")]
     if not images:
         return None
-    best = max(images, key=lambda img: (img.get("width") or 0) * (img.get("height") or 0))
+    best = max(images, key=lambda img: _dimension(img.get("width")) * _dimension(img.get("height")))
     return best.get("url")
+
+
+def _dimension(value: Any) -> int:
+    return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0
 
 
 def _item_total(playlist: dict[str, Any]) -> int:

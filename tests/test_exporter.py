@@ -352,9 +352,6 @@ class TestExportFailures:
         assert read_json(run_dir / "P" / "playlist.json")["playlist"]["cover"] is None
         assert not list((run_dir / "P").glob("cover.*"))
 
-    @pytest.mark.xfail(strict=True, raises=AssertionError,
-                       reason="BUG: _best_image multiplies width*height unchecked; a string dimension "
-                              "raises TypeError, which _save_cover does not catch, so the playlist fails")
     def test_non_numeric_image_dimensions_do_not_fail_the_playlist(self, client, api, tmp_path, capsys):
         api.add_playlist(playlist_meta("p1", "P"), [playlist_entry(track_item(1))],
                          images=[{"url": "https://img/cover", "width": "640", "height": "640"}])

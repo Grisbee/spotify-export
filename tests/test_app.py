@@ -253,10 +253,6 @@ class TestPagesAndLogin:
         assert "Błąd sieci".encode() in body
         assert not token_path.exists()
 
-    @pytest.mark.xfail(strict=True, raises=(ConnectionError, http.client.HTTPException),
-                       reason="BUG: _request_token calls resp.json() unguarded; a 200 non-JSON body "
-                              "(captive portal, proxy page) escapes as requests.JSONDecodeError and the "
-                              "handler drops the connection instead of showing the error page")
     def test_callback_shows_error_page_when_token_endpoint_returns_non_json(self, make_server, api):
         server = make_server(logged_in=False)
         api.on_token(make_response(body=b"<html>captive portal</html>", headers={"Content-Type": "text/html"}))
@@ -331,10 +327,6 @@ class TestPlaylistsApi:
         assert "11 min" in json.loads(body)["error"]
         assert clock.sleeps == []
 
-    @pytest.mark.xfail(strict=True, raises=(ConnectionError, http.client.HTTPException),
-                       reason="BUG: SpotifyClient.get calls resp.json() outside its RequestException guard; "
-                              "a 200 non-JSON body escapes as requests.JSONDecodeError, which _api does not "
-                              "catch, so the handler drops the connection with no response")
     def test_non_json_api_body_maps_to_502(self, server, api):
         api.on_get("/me", make_response(body=b"<html>captive portal</html>", headers={"Content-Type": "text/html"}))
 

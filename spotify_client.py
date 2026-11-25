@@ -106,12 +106,16 @@ class SpotifyClient:
             raise SpotifyError(0, f"Błąd sieci: {exc}") from exc
         if resp.status_code != 200:
             raise SpotifyError(resp.status_code, _error_message(resp))
-        token = resp.json()
+        token = _json_body(resp)
         token["expires_at"] = time.time() + token.get("expires_in", 3600) - 60
         # Spotify may omit the refresh token on refresh; keep the old one then.
         token.setdefault("refresh_token", previous_refresh)
         self._token = token
-        self._save_token()
+        try:
+            self._save_token()
+        except OSError as exc:
+            # The session still works from memory; it just won't survive a restart.
+            raise SpotifyError(0, f"Nie udało się zapisać tokenu: {exc}") from exc
 
     def logout(self) -> None:
         # Under the lock so an in-flight refresh can't re-save the token afterwards.
@@ -160,7 +164,7 @@ class SpotifyClient:
                 time.sleep(2 ** attempt)
                 continue
             if resp.status_code == 200:
-                return resp.json()
+                return _json_body(resp)
             if resp.status_code == 401 and not refreshed:
                 with self._lock:
                     self._refresh()
@@ -193,6 +197,14 @@ class SpotifyClient:
         resp = self._session.get(url, timeout=TIMEOUT)
         resp.raise_for_status()
         return resp
+
+
+def _json_body(resp: requests.Response) -> Any:
+    # A proxy or captive portal can answer 200 with an HTML page.
+    try:
+        return resp.json()
+    except ValueError as exc:
+        raise SpotifyError(resp.status_code, "Spotify zwrócił odpowiedź, która nie jest JSON-em.") from exc
 
 
 def _retry_after(resp: requests.Response) -> int:
