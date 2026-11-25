@@ -1,9 +1,11 @@
 """exporter: which playlists are offered, and what lands on disk per export."""
 from __future__ import annotations
 
+import io
 import json
 import re
 import unicodedata
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -410,6 +412,56 @@ class TestExportFailures:
 
         assert second.final("p1")[0] == "done"
         assert dir1 != dir2
+
+
+# --- zip_dir (the download-mode archive) ---------------------------------------------------
+
+def unzip(data: bytes) -> dict[str, bytes]:
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        assert zf.testzip() is None
+        return {info.filename: zf.read(info) for info in zf.infolist()}
+
+
+class TestZipDir:
+    @pytest.fixture
+    def run_dir(self, tmp_path: Path) -> Path:
+        run = tmp_path / "out" / "2026-11-25_143000"
+        (run / "Żółta łódź").mkdir(parents=True)
+        (run / "Żółta łódź" / "playlist.json").write_text('{"tracks": []}', encoding="utf-8")
+        (run / "Żółta łódź" / "cover.jpg").write_bytes(bytes(range(256)) * 4)
+        (run / "index.json").write_text('{"playlists": []}', encoding="utf-8")
+        (run / "empty-folder").mkdir()
+        return run
+
+    def test_files_are_nested_under_the_run_folder_with_exact_contents(self, run_dir):
+        files = unzip(exporter.zip_dir(run_dir))
+
+        assert files == {
+            "2026-11-25_143000/index.json": b'{"playlists": []}',
+            "2026-11-25_143000/Żółta łódź/playlist.json": b'{"tracks": []}',
+            "2026-11-25_143000/Żółta łódź/cover.jpg": bytes(range(256)) * 4,
+        }, "no absolute paths, no parent dirs above the run, no entries for empty folders"
+
+    def test_entries_are_compressed(self, run_dir):
+        with zipfile.ZipFile(io.BytesIO(exporter.zip_dir(run_dir))) as zf:
+            assert {i.compress_type for i in zf.infolist()} == {zipfile.ZIP_DEFLATED}
+
+    def test_non_ascii_names_are_flagged_utf8_so_unzippers_decode_them(self, run_dir):
+        with zipfile.ZipFile(io.BytesIO(exporter.zip_dir(run_dir))) as zf:
+            polish = [i for i in zf.infolist() if "łódź" in i.filename]
+        assert polish and all(i.flag_bits & 0x800 for i in polish)
+
+    def test_empty_run_dir_gives_a_valid_empty_archive(self, tmp_path):
+        assert unzip(exporter.zip_dir(tmp_path)) == {}
+
+    def test_zips_a_real_export_run(self, client, api, tmp_path):
+        api.add_playlist(playlist_meta("p1", "Moja"), [playlist_entry(track_item(1))])
+        run_dir = exporter.export(client, [scan_entry("p1", "Moja")], tmp_path, Progress())
+
+        files = unzip(exporter.zip_dir(run_dir))
+
+        assert set(files) == {f"{run_dir.name}/index.json", f"{run_dir.name}/Moja/playlist.json"}
+        assert json.loads(files[f"{run_dir.name}/Moja/playlist.json"])["playlist"]["id"] == "p1"
 
 
 # --- folder naming and labels (pure helpers with their own rules) --------------------------

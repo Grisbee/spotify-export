@@ -8,11 +8,17 @@ from __future__ import annotations
 
 import contextlib
 import http.client
+import io
 import json
 import os
+import re
+import subprocess
+import sys
+import tempfile
 import threading
 import time
 import urllib.parse
+import zipfile
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
@@ -20,7 +26,7 @@ import pytest
 import requests
 
 import app as app_module
-from app import App, ExportJob, load_dotenv, make_handler
+from app import FOLDER_PICKER_TIMEOUT, App, ExportJob, choose_folder, load_dotenv, make_handler
 from conftest import ME, make_response, playlist_entry, playlist_meta, track_item
 from spotify_client import TOKEN_URL
 from exporter import LIKED_SONGS_ID
@@ -112,6 +118,72 @@ def scan(server: Server) -> list[dict]:
     status, _, body = server.get("/api/playlists")
     assert status == 200
     return json.loads(body)
+
+
+class FakeOsascript:
+    """Stands in for `subprocess.run`: records argv/kwargs, returns a scripted
+    CompletedProcess or raises, so no dialog ever opens."""
+
+    def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = "",
+                 raises: BaseException | None = None) -> None:
+        self.returncode, self.stdout, self.stderr, self.raises = returncode, stdout, stderr, raises
+        self.calls: list[tuple[list[str], dict]] = []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append((list(argv), kwargs))
+        if self.raises:
+            raise self.raises
+        return subprocess.CompletedProcess(argv, self.returncode, self.stdout, self.stderr)
+
+    @property
+    def start_dir(self) -> str:
+        return self.calls[-1][0][3]
+
+
+@pytest.fixture(autouse=True)
+def no_real_subprocess(monkeypatch):
+    """Backstop: a code path that reaches the real osascript fails the test
+    instead of popping a Finder dialog."""
+    def refuse(*args, **kwargs):
+        raise AssertionError(f"real subprocess attempted: {args}")
+    monkeypatch.setattr(subprocess, "run", refuse)
+
+
+@pytest.fixture
+def picker(monkeypatch):
+    def install(**kw) -> FakeOsascript:
+        fake = FakeOsascript(**kw)
+        monkeypatch.setattr(subprocess, "run", fake)
+        return fake
+    return install
+
+
+@pytest.fixture
+def on_macos(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "darwin")
+
+
+@pytest.fixture
+def scratch_dirs(monkeypatch, tmp_path) -> list[Path]:
+    """Routes the download mode's mkdtemp into tmp_path and records each dir,
+    so a test can check it is gone afterwards."""
+    root = tmp_path / "scratch"
+    root.mkdir()
+    created: list[Path] = []
+    real = tempfile.mkdtemp
+
+    def tracking(*args, **kwargs):
+        path = real(*args, **{**kwargs, "dir": root})
+        created.append(Path(path))
+        return path
+
+    monkeypatch.setattr(tempfile, "mkdtemp", tracking)
+    return created
+
+
+def unzip(data: bytes) -> dict[str, bytes]:
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        return {name: zf.read(name) for name in zf.namelist()}
 
 
 # --- request guards ---------------------------------------------------------------------
@@ -431,6 +503,399 @@ class TestExportApi:
         assert [i["id"] for i in snap["items"]] == [LIKED_SONGS_ID]
 
 
+# --- export destinations: folder vs ZIP download ------------------------------------------------
+
+RUN_STAMP = re.compile(r"\d{4}-\d{2}-\d{2}_\d{6}")
+
+
+class TestExportDestination:
+    def test_custom_absolute_folder_receives_the_export(self, server, library, out_root, tmp_path):
+        target = tmp_path / "picked" / "not-yet-created"
+        scan(server)
+
+        assert server.post_json("/api/export", {"ids": ["own"], "mode": "folder", "folder": str(target)})[0] == 202
+        snap = server.wait_until_idle()
+
+        out = Path(snap["output_dir"])
+        assert out.parent == target
+        assert (out / "Moja" / "playlist.json").is_file()
+        assert not out_root.exists(), "the default folder must stay untouched"
+
+    def test_tilde_folder_is_expanded_to_home(self, server, library, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        monkeypatch.setenv("HOME", str(home))
+        scan(server)
+
+        assert server.post_json("/api/export", {"ids": ["own"], "folder": "~/Eksporty"})[0] == 202
+
+        assert Path(server.wait_until_idle()["output_dir"]).parent == home / "Eksporty"
+
+    @pytest.mark.parametrize("body", [{"ids": ["own"]}, {"ids": ["own"], "folder": None},
+                                      {"ids": ["own"], "folder": ""}, {"ids": ["own"], "mode": "folder"}],
+                             ids=["no-mode-no-folder", "folder-null", "folder-empty", "folder-mode-no-folder"])
+    def test_missing_folder_falls_back_to_default(self, server, library, out_root, body):
+        scan(server)
+
+        assert server.post_json("/api/export", body)[0] == 202
+        snap = server.wait_until_idle()
+
+        assert snap["mode"] == "folder"
+        assert Path(snap["output_dir"]).parent == out_root
+
+    def test_custom_folder_that_is_a_file_finishes_with_error(self, server, library, tmp_path):
+        blocker = tmp_path / "a-file"
+        blocker.write_text("")
+        scan(server)
+
+        assert server.post_json("/api/export", {"ids": ["own"], "folder": str(blocker)})[0] == 202
+        snap = server.wait_until_idle()
+
+        assert snap["output_dir"] is None
+        assert snap["error"]
+
+    @pytest.mark.parametrize(
+        "extra",
+        [{"mode": "zip"}, {"mode": None}, {"mode": ["folder"]}, {"mode": "FOLDER"},
+         {"folder": "output"}, {"folder": "./elsewhere"}, {"mode": "folder", "folder": 123}],
+        ids=["unknown-mode", "mode-null", "mode-list", "mode-wrong-case",
+             "relative-folder", "dot-relative-folder", "folder-not-a-string"],
+    )
+    def test_invalid_mode_or_folder_is_400_and_starts_nothing(self, server, library, out_root, tmp_path, extra):
+        scan(server)
+
+        status, _, body = server.post_json("/api/export", {"ids": ["own"], **extra})
+
+        assert status == 400
+        assert "error" in json.loads(body)
+        assert server.status()["items"] == []
+        assert library.calls_to("GET", "/playlists/own") == []
+        assert not out_root.exists()
+        assert not (tmp_path / "output").exists() and not (tmp_path / "elsewhere").exists()
+
+
+class TestDownloadMode:
+    def test_zip_is_built_offered_and_nothing_is_left_on_disk(self, server, library, out_root, scratch_dirs):
+        scan(server)
+
+        assert server.post_json("/api/export", {"ids": ["own", LIKED_SONGS_ID], "mode": "download",
+                                                "folder": None})[0] == 202
+        snap = server.wait_until_idle()
+
+        assert snap["error"] is None
+        assert (snap["mode"], snap["output_dir"], snap["download_ready"]) == ("download", None, True)
+        assert {i["status"] for i in snap["items"]} == {"done"}
+        assert not out_root.exists()
+        assert len(scratch_dirs) == 1 and not scratch_dirs[0].exists(), "temp export dir must be removed"
+
+        status, headers, data = server.get("/api/download")
+
+        assert status == 200
+        assert headers["Content-Type"] == "application/zip"
+        filename = re.fullmatch(r'attachment; filename="(spotify-export_(.+)\.zip)"; '
+                                r"filename\*=UTF-8''(.+)", headers["Content-Disposition"])
+        assert filename and filename.group(1) == filename.group(3)
+        stamp = filename.group(2)
+        assert RUN_STAMP.fullmatch(stamp)
+        files = unzip(data)
+        assert set(files) == {f"{stamp}/index.json", f"{stamp}/Moja/playlist.json",
+                              f"{stamp}/Polubione utwory/playlist.json"}
+        assert len(json.loads(files[f"{stamp}/Moja/playlist.json"])["tracks"]) == 2
+
+    def test_download_mode_ignores_a_folder_in_the_request(self, server, library, tmp_path, scratch_dirs):
+        elsewhere = tmp_path / "should-not-appear"
+        scan(server)
+
+        assert server.post_json("/api/export", {"ids": ["own"], "mode": "download",
+                                                "folder": str(elsewhere)})[0] == 202
+
+        assert server.wait_until_idle()["download_ready"] is True
+        assert not elsewhere.exists()
+
+    def test_zip_can_be_fetched_again(self, server, library, scratch_dirs):
+        scan(server)
+        server.post_json("/api/export", {"ids": ["own"], "mode": "download"})
+        server.wait_until_idle()
+
+        first, second = server.get("/api/download"), server.get("/api/download")
+
+        assert first[0] == second[0] == 200
+        assert first[2] == second[2]
+
+    def test_zip_failure_reports_error_and_still_removes_temp_dir(self, server, library, scratch_dirs,
+                                                                  monkeypatch):
+        def disk_full(run_dir):
+            assert run_dir.is_dir()
+            raise OSError("No space left on device")
+
+        monkeypatch.setattr(app_module.exporter, "zip_dir", disk_full)
+        scan(server)
+
+        server.post_json("/api/export", {"ids": ["own"], "mode": "download"})
+        snap = server.wait_until_idle()
+
+        assert snap["error"] == "No space left on device"
+        assert snap["download_ready"] is False
+        assert server.get("/api/download")[0] == 404
+        assert len(scratch_dirs) == 1 and not scratch_dirs[0].exists()
+
+    def test_unexpected_error_still_removes_temp_dir_and_ends_job(self, client, out_root, scratch_dirs,
+                                                                  monkeypatch):
+        def explode(client, entries, root, progress):
+            (root / "partial.json").write_text("{}")
+            raise ValueError("unexpected payload")
+
+        monkeypatch.setattr(app_module.exporter, "export", explode)
+        monkeypatch.setattr(app_module.traceback, "print_exc", lambda: None)
+        application = App(client, out_root, host="unused")
+        entries = [{"id": "a", "name": "A", "kind": "playlist"}]
+        application.job.start(entries, "download")
+
+        application._run_download(entries)
+
+        snap = application.job.snapshot()
+        assert (snap["running"], snap["download_ready"]) == (False, False)
+        assert "unexpected payload" in snap["error"]
+        assert len(scratch_dirs) == 1 and not scratch_dirs[0].exists()
+
+    @pytest.mark.xfail(strict=True, raises=AssertionError,
+                       reason="BUG: _run_download calls tempfile.mkdtemp before its try block; an OSError "
+                              "there (full disk, unwritable TMPDIR) kills the worker thread with the job "
+                              "still marked running, blocking every later export until restart")
+    def test_temp_dir_creation_failure_does_not_leave_job_running(self, client, out_root, monkeypatch):
+        def no_tmp(*args, **kwargs):
+            raise OSError("Read-only file system")
+
+        monkeypatch.setattr(tempfile, "mkdtemp", no_tmp)
+        application = App(client, out_root, host="unused")
+        entries = [{"id": "a", "name": "A", "kind": "playlist"}]
+        application.job.start(entries, "download")
+
+        with contextlib.suppress(OSError):
+            application._run_download(entries)
+
+        snap = application.job.snapshot()
+        assert snap["running"] is False
+        assert snap["error"]
+
+
+class TestDownloadApi:
+    def test_nothing_to_download_before_any_export(self, server):
+        status, headers, body = server.get("/api/download")
+        assert status == 404
+        assert headers["Content-Type"] == "application/json"
+        assert "error" in json.loads(body)
+
+    def test_folder_export_offers_no_download(self, server, library):
+        scan(server)
+        server.post_json("/api/export", {"ids": ["own"]})
+        assert server.wait_until_idle()["download_ready"] is False
+
+        assert server.get("/api/download")[0] == 404
+
+    def test_starting_a_new_export_withdraws_the_previous_zip(self, server, library, scratch_dirs):
+        scan(server)
+        server.post_json("/api/export", {"ids": ["own"], "mode": "download"})
+        server.wait_until_idle()
+        assert server.get("/api/download")[0] == 200
+
+        server.post_json("/api/export", {"ids": ["own"], "mode": "folder"})
+        snap = server.wait_until_idle()
+
+        assert (snap["mode"], snap["download_ready"]) == ("folder", False)
+        assert server.get("/api/download")[0] == 404
+
+    def test_foreign_host_cannot_fetch_the_zip(self, server, library, scratch_dirs):
+        scan(server)
+        server.post_json("/api/export", {"ids": ["own"], "mode": "download"})
+        server.wait_until_idle()
+
+        status, _, body = server.get("/api/download", headers={"Host": "evil.example:8888"})
+
+        assert (status, body) == (403, b"Forbidden")
+
+
+# --- /api/config --------------------------------------------------------------------------------
+
+class TestConfigApi:
+    @pytest.mark.parametrize(("platform", "can_choose"), [("darwin", True), ("linux", False), ("win32", False)])
+    def test_reports_default_folder_and_picker_availability(self, server, out_root, monkeypatch,
+                                                            platform, can_choose):
+        monkeypatch.setattr(sys, "platform", platform)
+
+        status, _, body = server.get("/api/config")
+
+        assert status == 200
+        assert json.loads(body) == {"default_folder": str(out_root), "can_choose_folder": can_choose}
+
+
+# --- /api/choose-folder (macOS picker, faked) ---------------------------------------------------
+
+class TestChooseFolderApi:
+    def test_returns_the_picked_folder_without_trailing_slash(self, server, picker, on_macos, tmp_path):
+        current = tmp_path / "current"
+        current.mkdir()
+        fake = picker(stdout="/Users/me/Music/Eksport/\n")
+
+        status, _, body = server.post_json("/api/choose-folder", {"current": str(current)})
+
+        assert (status, json.loads(body)) == (200, {"path": "/Users/me/Music/Eksport"})
+        argv, kwargs = fake.calls[0]
+        assert argv[:2] == ["osascript", "-e"] and argv[3] == str(current)
+        assert kwargs == {"capture_output": True, "text": True, "timeout": FOLDER_PICKER_TIMEOUT}
+
+    def test_cancel_returns_null_path(self, server, picker, on_macos):
+        picker(returncode=1, stderr="0:180: execution error: User canceled. (-128)\n")
+
+        status, _, body = server.post_json("/api/choose-folder", {})
+
+        assert (status, json.loads(body)) == (200, {"path": None})
+
+    @pytest.mark.parametrize(
+        ("fake_kw", "message"),
+        [({"returncode": 1, "stderr": "execution error: Not authorized to send Apple events (-1743)\n"},
+          "Not authorized to send Apple events (-1743)"),
+         ({"returncode": 1, "stderr": ""}, "osascript failed"),
+         ({"raises": subprocess.TimeoutExpired("osascript", FOLDER_PICKER_TIMEOUT)}, "timed out"),
+         ({"raises": FileNotFoundError(2, "No such file or directory", "osascript")}, "No such file")],
+        ids=["osascript-error", "error-without-stderr", "dialog-timeout", "osascript-missing"],
+    )
+    def test_picker_failures_are_500_with_reason(self, server, picker, on_macos, fake_kw, message):
+        picker(**fake_kw)
+
+        status, _, body = server.post_json("/api/choose-folder", {})
+
+        assert status == 500
+        error = json.loads(body)["error"]
+        assert error.startswith("Nie udało się otworzyć okna: ")
+        assert message in error
+
+    def test_not_on_macos_is_501_and_runs_nothing(self, server, picker, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "linux")
+        fake = picker()
+
+        status, _, body = server.post_json("/api/choose-folder", {})
+
+        assert status == 501
+        assert "error" in json.loads(body)
+        assert fake.calls == []
+
+    @pytest.mark.parametrize("body", [{}, {"current": None}, {"current": ""}, b"{not json", b"[]"],
+                             ids=["no-current", "current-null", "current-empty", "invalid-json", "array-body"])
+    def test_without_current_folder_starts_from_nearest_existing_default(self, server, picker, on_macos,
+                                                                         out_root, tmp_path, body):
+        assert not out_root.exists()
+        fake = picker(stdout="/x\n")
+
+        assert server.post_json("/api/choose-folder", body)[0] == 200
+
+        assert fake.start_dir == str(tmp_path)
+
+    def test_deleted_saved_folder_starts_from_its_nearest_existing_parent(self, server, picker, on_macos,
+                                                                          tmp_path):
+        fake = picker(stdout="/x\n")
+
+        server.post_json("/api/choose-folder", {"current": str(tmp_path / "gone" / "deeper")})
+
+        assert fake.start_dir == str(tmp_path)
+
+    @pytest.mark.parametrize(
+        "send",
+        [lambda s: s.request("POST", "/api/choose-folder", body="{}", headers={"Content-Type": "text/plain"}),
+         lambda s: s.request("POST", "/api/choose-folder", body="{}",
+                             headers={"Content-Type": "application/json", "Host": "evil.example"}),
+         lambda s: s.get("/api/choose-folder")],
+        ids=["cors-simple-post", "foreign-host", "get"],
+    )
+    def test_other_sites_cannot_pop_the_dialog(self, server, picker, on_macos, send):
+        fake = picker()
+
+        assert send(server)[0] in (403, 404, 415)
+
+        assert fake.calls == []
+
+
+class TestChooseFolder:
+    def test_path_is_passed_as_argument_never_spliced_into_script(self, picker, tmp_path):
+        benign = tmp_path / "plain"
+        hostile = tmp_path / 'x" & (do shell script "touch pwned") & "'
+        benign.mkdir()
+        hostile.mkdir()
+        fake = picker(stdout="/x\n")
+
+        choose_folder(benign)
+        choose_folder(hostile)
+
+        (argv_benign, _), (argv_hostile, _) = fake.calls
+        assert argv_hostile[3] == str(hostile)
+        assert argv_benign[2] == argv_hostile[2], "script source must not depend on the path"
+        assert "do shell script" not in argv_hostile[2]
+
+    def test_unreachable_start_walks_up_to_filesystem_root(self, picker, monkeypatch):
+        fake = picker(stdout="/picked\n")
+        monkeypatch.setattr(Path, "is_dir", lambda self: str(self) == "/")
+
+        assert choose_folder(Path("/a/b/c")) == Path("/picked")
+        assert fake.start_dir == "/"
+
+    def test_cancel_is_none(self, picker, tmp_path):
+        picker(returncode=1, stderr="execution error: User canceled. (-128)")
+        assert choose_folder(tmp_path) is None
+
+    def test_other_failure_raises_oserror_with_stderr(self, picker, tmp_path):
+        picker(returncode=1, stderr="  boom (-1700)  \n")
+        with pytest.raises(OSError, match=r"^boom \(-1700\)$"):
+            choose_folder(tmp_path)
+
+
+# --- /api/shutdown --------------------------------------------------------------------------------
+
+class TestShutdownApi:
+    def test_answers_then_requests_shutdown_once(self, server):
+        # The handler replies first and calls the hook afterwards, so the hook
+        # may still be pending when the response arrives.
+        calls, called = [], threading.Event()
+        server.app.request_shutdown = lambda: (calls.append("stop"), called.set())
+
+        status, _, body = server.post_json("/api/shutdown", {})
+
+        assert (status, json.loads(body)) == (200, {"ok": True})
+        assert called.wait(5)
+        assert calls == ["stop"]
+
+    def test_confirmation_reaches_the_browser_while_shutdown_is_still_running(self, server):
+        # The hook blocks longer than the client's 5 s timeout: had the server
+        # stopped before replying, this request would time out.
+        entered, release = threading.Event(), threading.Event()
+
+        def slow_stop():
+            entered.set()
+            release.wait(10)
+
+        server.app.request_shutdown = slow_stop
+        try:
+            status, _, body = server.post_json("/api/shutdown", {})
+            assert entered.wait(5)
+        finally:
+            release.set()
+        assert (status, json.loads(body)) == (200, {"ok": True})
+
+    @pytest.mark.parametrize(
+        "send",
+        [lambda s: s.request("POST", "/api/shutdown", body="{}", headers={"Content-Type": "text/plain"}),
+         lambda s: s.request("POST", "/api/shutdown", body="{}",
+                             headers={"Content-Type": "application/json", "Host": "evil.example"}),
+         lambda s: s.get("/api/shutdown")],
+        ids=["cors-simple-post", "foreign-host", "get"],
+    )
+    def test_other_sites_cannot_stop_the_server(self, server, send):
+        calls = []
+        server.app.request_shutdown = lambda: calls.append("stop")
+
+        assert send(server)[0] in (403, 404, 415)
+
+        assert calls == []
+
+
 # --- job state (unit) -----------------------------------------------------------------------------
 
 class TestExportJob:
@@ -451,6 +916,37 @@ class TestExportJob:
         assert job.snapshot() == {"running": True, "mode": "folder", "output_dir": None,
                                   "download_ready": False, "error": None,
                                   "items": [{"id": "b", "name": "B", "status": "pending", "detail": None}]}
+
+    def test_download_run_exposes_mode_and_readiness(self):
+        job = ExportJob()
+        job.start([{"id": "a", "name": "A"}], "download")
+        assert job.snapshot()["mode"] == "download"
+        assert job.snapshot()["download_ready"] is False
+
+        job.finish(None, download=("spotify-export_x.zip", b"PK\x05\x06"))
+
+        snap = job.snapshot()
+        assert (snap["running"], snap["mode"], snap["output_dir"], snap["download_ready"], snap["error"]) == \
+            (False, "download", None, True, None)
+        assert job.download == ("spotify-export_x.zip", b"PK\x05\x06")
+
+    def test_restart_drops_previous_download_and_resets_mode(self):
+        job = ExportJob()
+        job.start([{"id": "a", "name": "A"}], "download")
+        job.finish(None, download=("x.zip", b"PK"))
+
+        assert job.start([{"id": "b", "name": "B"}])
+
+        assert job.download is None
+        assert (job.snapshot()["mode"], job.snapshot()["download_ready"]) == ("folder", False)
+
+    def test_refused_start_keeps_running_job_mode(self):
+        job = ExportJob()
+        job.start([{"id": "a", "name": "A"}], "download")
+
+        assert not job.start([{"id": "b", "name": "B"}], "folder")
+
+        assert job.snapshot()["mode"] == "download"
 
     def test_unexpected_error_in_export_does_not_leave_job_running(self, client, out_root, monkeypatch):
         def explode(*args, **kwargs):
