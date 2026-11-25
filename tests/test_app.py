@@ -586,8 +586,6 @@ class TestExportDestination:
         assert server.status()["items"] == []
         assert library.calls_to("GET", "/playlists/own") == []
 
-    @pytest.mark.xfail(strict=True, reason="BUG: a NUL byte outside a ~user prefix passes validation; "
-                                           "the export thread then fails on mkdir instead of a 400")
     def test_nul_byte_in_absolute_folder_is_400(self, server, library, tmp_path, monkeypatch):
         monkeypatch.setattr(app_module.traceback, "print_exc", lambda: None)
         scan(server)

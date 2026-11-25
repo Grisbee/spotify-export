@@ -142,8 +142,11 @@ class App:
 
 
 def _expand(raw: Any) -> Path | None:
-    """`~`-expanded path, or None for input expanduser rejects (unknown
-    user, NUL byte) — such a request is a 400, not a dropped connection."""
+    """`~`-expanded path, or None for input no filesystem call would accept
+    (unknown user, NUL byte). Callers decide: /api/export answers 400, the
+    folder picker falls back to the default start folder."""
+    if "\x00" in str(raw):
+        return None
     try:
         return Path(str(raw)).expanduser()
     except (RuntimeError, ValueError):
