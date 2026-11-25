@@ -119,6 +119,7 @@ class SpotifyClient:
     def _save_token(self) -> None:
         # The file holds a long-lived refresh token, so keep it owner-only.
         fd = os.open(self.token_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.fchmod(fd, 0o600)  # O_CREAT's mode doesn't apply to an existing file
         with os.fdopen(fd, "w") as f:
             json.dump(self._token, f)
 
@@ -152,7 +153,7 @@ class SpotifyClient:
                 refreshed = True
                 continue
             if resp.status_code == 429:
-                time.sleep(int(resp.headers.get("Retry-After", "5")) + 1)
+                time.sleep(_retry_after(resp) + 1)
                 continue
             if resp.status_code >= 500 and attempt < MAX_RETRIES - 1:
                 time.sleep(2 ** attempt)
@@ -174,6 +175,13 @@ class SpotifyClient:
         resp = self._session.get(url, timeout=TIMEOUT)
         resp.raise_for_status()
         return resp
+
+
+def _retry_after(resp: requests.Response) -> int:
+    try:
+        return max(0, int(resp.headers.get("Retry-After", "5")))
+    except ValueError:
+        return 5
 
 
 def _error_message(resp: requests.Response) -> str:

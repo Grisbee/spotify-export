@@ -63,8 +63,7 @@ def export(
     {"running", "done", "error"}; a failure of one playlist doesn't stop the rest.
     """
     exported_at = datetime.now(timezone.utc)
-    run_dir = out_root / exported_at.astimezone().strftime("%Y-%m-%d_%H%M%S")
-    run_dir.mkdir(parents=True, exist_ok=True)
+    run_dir = _new_run_dir(out_root, exported_at.astimezone().strftime("%Y-%m-%d_%H%M%S"))
     used_names: set[str] = set()
     index = []
 
@@ -81,7 +80,7 @@ def export(
             (folder / "playlist.json").write_text(
                 json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8"
             )
-        except (SpotifyError, OSError) as exc:
+        except (SpotifyError, OSError, ValueError, KeyError) as exc:
             message = str(exc)
             if isinstance(exc, SpotifyError) and exc.status == 403:
                 message = "Spotify nie udostępnia utworów tej playlisty (nie jesteś jej współtwórcą)."
@@ -205,6 +204,18 @@ def _item_total(playlist: dict[str, Any]) -> int:
         if isinstance(value, dict) and "total" in value:
             return value["total"]
     return 0
+
+
+def _new_run_dir(out_root: Path, stamp: str) -> Path:
+    out_root.mkdir(parents=True, exist_ok=True)
+    n = 1
+    while True:
+        run_dir = out_root / (stamp if n == 1 else f"{stamp}-{n}")
+        try:
+            run_dir.mkdir()
+            return run_dir
+        except FileExistsError:
+            n += 1
 
 
 def _tracks_label(n: int) -> str:

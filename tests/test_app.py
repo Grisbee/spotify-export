@@ -369,11 +369,6 @@ class TestExportJob:
         assert job.snapshot() == {"running": True, "output_dir": None, "error": None,
                                   "items": [{"id": "b", "name": "B", "status": "pending", "detail": None}]}
 
-    @pytest.mark.xfail(strict=True, reason=(
-        "BUG: App._run_export only catches SpotifyError/OSError; any other exception "
-        "(e.g. ValueError from a non-JSON 200 body, KeyError on a malformed payload) kills "
-        "the thread before job.finish(), so the job stays running and every later export "
-        "gets 409 until the app is restarted"))
     def test_unexpected_error_in_export_does_not_leave_job_running(self, client, out_root, monkeypatch):
         def explode(*args, **kwargs):
             raise ValueError("unexpected payload")

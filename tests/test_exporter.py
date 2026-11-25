@@ -311,9 +311,6 @@ class TestExportFailures:
         assert api.calls_to("GET", "https://img/fresh")
         assert not api.calls_to("GET", "https://img/expired")
 
-    @pytest.mark.xfail(strict=True, reason=(
-        "BUG: run dir is named to the second and created with exist_ok=True; a second "
-        "export in the same second collides on folder.mkdir() and overwrites index.json"))
     def test_two_exports_in_the_same_second_do_not_collide(self, client, api, tmp_path, monkeypatch):
         frozen = datetime(2026, 11, 25, 13, 30, 12, tzinfo=timezone.utc)
 

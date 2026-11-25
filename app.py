@@ -11,6 +11,7 @@ import json
 import os
 import sys
 import threading
+import traceback
 import urllib.parse
 import webbrowser
 from http import HTTPStatus
@@ -82,7 +83,8 @@ class App:
     def start_export(self, ids: list[str]) -> bool:
         # Only ids from the last scan are accepted, so the UI can't request
         # playlists the user isn't allowed to read.
-        entries = [self.scanned[i] for i in ids if i in self.scanned]
+        unique_ids = dict.fromkeys(ids)  # drop repeats, keep the UI's order
+        entries = [self.scanned[i] for i in unique_ids if i in self.scanned]
         if not entries or not self.job.start(entries):
             return False
         threading.Thread(target=self._run_export, args=(entries,), daemon=True).start()
@@ -93,6 +95,11 @@ class App:
             out = exporter.export(self.client, entries, self.out_root, self.job.progress)
         except (SpotifyError, OSError) as exc:
             self.job.finish(None, str(exc))
+        except Exception as exc:
+            # Anything else would kill the thread with the job still marked
+            # running, blocking every later export until restart.
+            traceback.print_exc()
+            self.job.finish(None, f"Nieoczekiwany błąd: {exc!r}")
         else:
             self.job.finish(out)
 
@@ -166,10 +173,12 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
                 self._json(status, {"error": str(exc)})
 
         def _read_json(self) -> Any:
-            length = int(self.headers.get("Content-Length") or 0)
             try:
+                length = int(self.headers.get("Content-Length") or 0)
+                if not 0 <= length <= 1_000_000:  # read(-1) would block until EOF
+                    return None
                 return json.loads(self.rfile.read(length) or b"null")
-            except json.JSONDecodeError:
+            except (ValueError, json.JSONDecodeError):
                 return None
 
         def _error_page(self, message: str) -> None:
