@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -11,6 +12,7 @@ import pytest
 import exporter
 from conftest import ME, make_response, playlist_entry, playlist_meta, track_item
 from exporter import LIKED_SONGS_ID
+from spotify_client import API_URL, PAGE_LIMIT
 
 
 @pytest.fixture
@@ -113,6 +115,20 @@ class TestScan:
         api.on_paged("/me/playlists", [playlist_meta("p1", "X", **fields)])
         assert exporter.scan(client)[1]["track_count"] == expected
 
+    @pytest.mark.parametrize(
+        ("images", "expected"),
+        [
+            ({"error": "unexpected shape"}, None),
+            ([None, "https://img/str", {"width": 640}, {"url": "", "width": 900, "height": 900},
+              {"url": "https://img/ok", "width": 10, "height": 10}], "https://img/ok"),
+        ],
+        ids=["not-a-list", "junk-entries-skipped"],
+    )
+    def test_malformed_images_do_not_break_the_scan(self, client, api, me, images, expected):
+        liked_total(api, 0)
+        api.on_paged("/me/playlists", [playlist_meta("p1", "X", images=images)])
+        assert exporter.scan(client)[1]["image"] == expected
+
     def test_unnamed_playlist_and_no_images(self, client, api, me):
         liked_total(api, 0)
         api.on_paged("/me/playlists", [playlist_meta("p1", "", images=None)])
@@ -201,6 +217,13 @@ class TestExportPlaylist:
     def test_progress_reports_running_then_done_with_count(self, run):
         assert run[1].events == [("p1", "running", None), ("p1", "done", "3 utwory")]
 
+    def test_items_request_asks_for_episodes_on_the_first_page(self, run, api):
+        first, *later = api.calls_to("GET", "/playlists/p1/items")
+
+        assert first["params"] == {"limit": PAGE_LIMIT, "additional_types": "track,episode"}
+        assert later == []  # page two came from the absolute `next` URL
+        assert api.calls_to("GET", f"{API_URL}/playlists/p1/items?offset=2&limit=50")
+
     def test_episode_takes_album_from_show(self, client, api, tmp_path):
         episode = {"type": "episode", "name": "Ep", "show": {"name": "Podcast"}, "uri": "spotify:episode:e"}
         api.add_playlist(playlist_meta("p1", "Pods"), [playlist_entry(episode)])
@@ -268,13 +291,54 @@ class TestExportFailures:
         assert progress.final("gone") == ("error", "Spotify API 404: Not found")
 
     @pytest.mark.parametrize(
+        "break_playlist",
+        [
+            lambda api: api.on_get("/playlists/bad", make_response(json_body={"name": "no id field"})),
+            lambda api: api.add_playlist(playlist_meta("bad", "Bad"),
+                                         [playlist_entry(track_item(1, artists=[None]))]),
+            lambda api: api.add_playlist(playlist_meta("bad", "Bad"), [None]),
+        ],
+        ids=["missing-key", "null-artist", "null-entry"],
+    )
+    def test_unexpected_payload_fails_only_that_playlist(self, client, api, tmp_path, capsys, break_playlist):
+        break_playlist(api)
+        api.add_playlist(playlist_meta("ok", "Fine"), [playlist_entry(track_item(1))])
+        progress = Progress()
+
+        run_dir = exporter.export(
+            client, [scan_entry("bad", "Bad"), scan_entry("ok", "Fine")], tmp_path, progress)
+
+        status, detail = progress.final("bad")
+        assert status == "error"
+        assert detail.startswith("Nieoczekiwany błąd: ")
+        assert progress.final("ok") == ("done", "1 utwór")
+        index = read_json(run_dir / "index.json")["playlists"]
+        assert index[0] == {"id": "bad", "name": "Bad", "error": detail}
+        assert index[1]["folder"] == "Fine"
+        assert "Traceback" in capsys.readouterr().err, "unexpected errors must leave a trace for debugging"
+
+    def test_non_json_api_body_fails_only_that_playlist(self, client, api, tmp_path, capsys):
+        api.on_get("/playlists/bad", make_response(body=b"<html>captive portal</html>"))
+        api.add_playlist(playlist_meta("ok", "Fine"), [playlist_entry(track_item(1))])
+        progress = Progress()
+
+        exporter.export(client, [scan_entry("bad", "Bad"), scan_entry("ok", "Fine")], tmp_path, progress)
+
+        assert progress.final("bad")[0] == "error"
+        assert progress.final("ok") == ("done", "1 utwór")
+
+    @pytest.mark.parametrize(
         "break_cover",
         [
             lambda api: api.on_get("/playlists/p1/images", make_response(404, json_body={"error": "x"})),
             lambda api: api.on_get("/playlists/p1/images", make_response(json_body=[])),
             lambda api: api.on_get("https://img/cover", make_response(500)),
+            lambda api: api.on_get("/playlists/p1/images", make_response(json_body={"images": []})),
+            lambda api: api.on_get("/playlists/p1/images", make_response(json_body=[None, "x", {"width": 9}])),
+            lambda api: api.on_get("/playlists/p1/images", make_response(json_body=None)),
         ],
-        ids=["images-endpoint-error", "no-images", "download-fails"],
+        ids=["images-endpoint-error", "no-images", "download-fails", "object-not-list", "junk-entries",
+             "json-null"],
     )
     def test_cover_problems_never_fail_the_playlist(self, client, api, tmp_path, break_cover):
         api.add_playlist(playlist_meta("p1", "P"), [playlist_entry(track_item(1))],
@@ -287,6 +351,27 @@ class TestExportFailures:
         assert progress.final("p1") == ("done", "1 utwór")
         assert read_json(run_dir / "P" / "playlist.json")["playlist"]["cover"] is None
         assert not list((run_dir / "P").glob("cover.*"))
+
+    @pytest.mark.xfail(strict=True, raises=AssertionError,
+                       reason="BUG: _best_image multiplies width*height unchecked; a string dimension "
+                              "raises TypeError, which _save_cover does not catch, so the playlist fails")
+    def test_non_numeric_image_dimensions_do_not_fail_the_playlist(self, client, api, tmp_path, capsys):
+        api.add_playlist(playlist_meta("p1", "P"), [playlist_entry(track_item(1))],
+                         images=[{"url": "https://img/cover", "width": "640", "height": "640"}])
+        progress = Progress()
+
+        exporter.export(client, [scan_entry("p1", "P")], tmp_path, progress)
+
+        assert progress.final("p1") == ("done", "1 utwór")
+
+    def test_valid_image_is_used_when_the_list_also_holds_junk(self, client, api, tmp_path):
+        api.add_playlist(playlist_meta("p1", "P"), [], images=[{"url": "https://img/good", "width": 1, "height": 1}])
+        api.on_get("/playlists/p1/images", make_response(json_body=[
+            None, {"width": 640, "height": 640}, {"url": "https://img/good", "width": 1, "height": 1}]))
+
+        run_dir = exporter.export(client, [scan_entry("p1", "P")], tmp_path, Progress())
+
+        assert read_json(run_dir / "P" / "playlist.json")["playlist"]["cover"] == "cover.png"
 
     @pytest.mark.parametrize(
         ("content_type", "filename"),
@@ -343,12 +428,50 @@ class TestFolderNames:
             ("..", "playlista"),
             ("", "playlista"),
             ("x" * 200, "x" * 80),
+            ("x" * 79 + " tail", "x" * 79),
+            ("x" * 79 + ".tail", "x" * 79),
         ],
         ids=["slash-colon-question", "windows-reserved", "control-char", "leading-dot-space",
-             "dots-only", "empty", "truncated"],
+             "dots-only", "empty", "truncated", "space-at-cut", "dot-at-cut"],
     )
     def test_names_are_filesystem_safe(self, name, expected):
         assert exporter._unique_folder_name(name, set()) == expected
+
+    def test_decomposed_unicode_is_normalized_to_nfc(self):
+        decomposed = unicodedata.normalize("NFD", "Żółć")
+        assert decomposed != "Żółć"
+
+        assert exporter._unique_folder_name(decomposed, set()) == "Żółć"
+
+    def test_truncation_counts_composed_characters(self):
+        # 80 composed letters are 160 code points in NFD; cutting before
+        # normalizing would keep only 40 letters (or split one in half).
+        assert exporter._unique_folder_name(unicodedata.normalize("NFD", "é" * 100), set()) == "é" * 80
+
+    @pytest.mark.parametrize(
+        ("first", "second", "second_folder"),
+        [
+            ("Żółć", unicodedata.normalize("NFD", "Żółć"), "Żółć (2)"),
+            ("Straße", "STRASSE", "STRASSE (2)"),
+        ],
+        ids=["nfc-vs-nfd", "casefold"],
+    )
+    def test_names_a_filesystem_may_conflate_are_numbered(self, first, second, second_folder):
+        used: set[str] = set()
+        exporter._unique_folder_name(first, used)
+        assert exporter._unique_folder_name(second, used) == second_folder
+
+    def test_nfc_and_nfd_spellings_export_to_separate_folders(self, client, api, tmp_path):
+        api.add_playlist(playlist_meta("a", "Żółć"), [playlist_entry(track_item(1))])
+        api.add_playlist(playlist_meta("b", "Żółć"), [playlist_entry(track_item(2))])
+        nfd = unicodedata.normalize("NFD", "Żółć")
+
+        run_dir = exporter.export(client, [scan_entry("a", "Żółć"), scan_entry("b", nfd)], tmp_path, Progress())
+
+        folders = [p["folder"] for p in read_json(run_dir / "index.json")["playlists"]]
+        assert folders == ["Żółć", "Żółć (2)"]
+        assert read_json(run_dir / folders[0] / "playlist.json")["playlist"]["id"] == "a"
+        assert read_json(run_dir / folders[1] / "playlist.json")["playlist"]["id"] == "b"
 
     def test_duplicates_get_numbered_case_insensitively(self):
         used: set[str] = set()

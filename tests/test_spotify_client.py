@@ -4,14 +4,18 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import stat
+import threading
 import urllib.parse
 
 import pytest
 import requests
 
 from conftest import CLIENT_ID, REDIRECT_URI, make_response, write_token
-from spotify_client import API_URL, MAX_RETRIES, PAGE_LIMIT, SCOPES, TOKEN_URL, SpotifyClient, SpotifyError
+import spotify_client
+from spotify_client import (API_URL, MAX_RETRIES, MAX_RETRY_AFTER, PAGE_LIMIT, SCOPES, TOKEN_URL,
+                            SpotifyClient, SpotifyError)
 
 OK = make_response(json_body={"ok": True})
 
@@ -113,6 +117,19 @@ class TestAuthorizeAndLogin:
         assert not client.logged_in
         assert not token_path.exists()
 
+    def test_network_error_on_code_exchange_becomes_spotify_error_0(self, make_client, api, token_path):
+        client = make_client(logged_in=False)
+        api.on_token(requests.ConnectionError("dns failure"))
+        state = query_of(client.authorize_url())["state"]
+
+        with pytest.raises(SpotifyError, match="dns failure") as exc:
+            client.complete_login("code", state)
+
+        assert exc.value.status == 0
+        assert isinstance(exc.value.__cause__, requests.ConnectionError)
+        assert not client.logged_in
+        assert not token_path.exists()
+
 
 # --- token storage ----------------------------------------------------------------
 
@@ -135,6 +152,89 @@ class TestTokenStorage:
         client = make_client(logged_in=False)
         client.logout()
         assert not token_path.exists()
+
+    def test_saving_over_a_world_readable_file_leaves_it_owner_only(self, make_client, api, clock, token_path):
+        client = make_client(expires_at=clock.now - 1)
+        token_path.chmod(0o644)
+        api.on_token(make_response(json_body={"access_token": "AT-2", "expires_in": 3600}))
+        api.on_get("/me", OK)
+
+        client.get("/me")
+
+        assert stat.S_IMODE(token_path.stat().st_mode) == 0o600
+        assert json.loads(token_path.read_text())["access_token"] == "AT-2"
+
+    def test_save_leaves_no_temp_file_behind(self, make_client, api, clock, token_path):
+        client = make_client(expires_at=clock.now - 1)
+        api.on_token(make_response(json_body={"access_token": "AT-2", "expires_in": 3600}))
+        api.on_get("/me", OK)
+
+        client.get("/me")
+
+        assert sorted(p.name for p in token_path.parent.iterdir()) == [token_path.name]
+
+    def test_stale_world_readable_temp_file_is_tightened_before_writing(self, make_client, api, clock, token_path):
+        # O_CREAT's 0o600 is ignored for a file that already exists, so only
+        # the explicit fchmod keeps a leftover temp file from leaking the token.
+        tmp = token_path.with_name(token_path.name + ".tmp")
+        tmp.write_text("leftover")
+        tmp.chmod(0o644)
+        client = make_client(expires_at=clock.now - 1)
+        api.on_token(make_response(json_body={"access_token": "AT-2", "expires_in": 3600}))
+        api.on_get("/me", OK)
+
+        client.get("/me")
+
+        assert stat.S_IMODE(token_path.stat().st_mode) == 0o600
+        assert json.loads(token_path.read_text())["access_token"] == "AT-2"
+
+    def test_interrupted_write_keeps_the_previous_token_file(self, make_client, api, clock, token_path, monkeypatch):
+        client = make_client(expires_at=clock.now - 1)
+        api.on_token(make_response(json_body={"access_token": "AT-2", "refresh_token": "RT-2", "expires_in": 3600}))
+
+        def disk_full(obj, f):
+            f.write('{"access_token": "AT-')
+            raise OSError("No space left on device")
+
+        monkeypatch.setattr(spotify_client.json, "dump", disk_full)
+
+        # The error type is not this test's concern, only what is left on disk.
+        with pytest.raises((OSError, SpotifyError)):
+            client.get("/me")
+
+        assert json.loads(token_path.read_text())["refresh_token"] == "RT-1"
+
+    def test_token_is_saved_where_os_has_no_fchmod(self, make_client, api, token_path, monkeypatch):
+        # Windows before Python 3.13 has no os.fchmod.
+        monkeypatch.delattr(os, "fchmod")
+        client = make_client(logged_in=False)
+        api.on_token(make_response(json_body={"access_token": "AT", "refresh_token": "RT", "expires_in": 3600}))
+
+        client.complete_login("code", query_of(client.authorize_url())["state"])
+
+        assert json.loads(token_path.read_text())["refresh_token"] == "RT"
+        assert SpotifyClient(CLIENT_ID, REDIRECT_URI, token_path).logged_in
+
+    def test_logout_waits_for_an_in_flight_refresh_instead_of_being_undone(self, make_client, api, clock, token_path):
+        client = make_client(expires_at=clock.now - 1)
+        logout = threading.Thread(target=client.logout)
+
+        def refresh_response():
+            # Runs while the refreshing thread holds the client lock.
+            logout.start()
+            logout.join(0.2)
+            assert logout.is_alive(), "logout must not complete while a refresh is mid-flight"
+            return make_response(json_body={"access_token": "AT-2", "refresh_token": "RT-2", "expires_in": 3600})
+
+        api.on_token(refresh_response)
+        api.on_get("/me", OK)
+
+        client.get("/me")
+        logout.join(5)
+
+        assert not logout.is_alive()
+        assert not client.logged_in
+        assert not token_path.exists(), "refresh re-saved the token after logout"
 
     def test_get_while_logged_out_raises_401_without_request(self, make_client, api):
         client = make_client(logged_in=False)
@@ -172,16 +272,75 @@ class TestRefresh:
         client.get("/me")
         assert api.calls_to("POST", TOKEN_URL) == []
 
-    def test_failed_refresh_logs_out(self, make_client, api, clock, token_path):
+    @pytest.mark.parametrize("status", [400, 401], ids=["invalid-grant", "invalid-client"])
+    def test_rejected_refresh_logs_out(self, make_client, api, clock, token_path, status):
         client = make_client(expires_at=clock.now - 1)
-        api.on_token(make_response(400, json_body={"error": "invalid_grant",
-                                                    "error_description": "Refresh token revoked"}))
+        api.on_token(make_response(status, json_body={"error": "invalid_grant",
+                                                       "error_description": "Refresh token revoked"}))
 
-        with pytest.raises(SpotifyError, match="Refresh token revoked"):
+        with pytest.raises(SpotifyError, match="Refresh token revoked") as exc:
             client.get("/me")
 
+        assert exc.value.status == status
         assert not client.logged_in
         assert not token_path.exists()
+
+    @pytest.mark.parametrize(
+        ("failure", "status"),
+        [
+            (make_response(500, json_body={"error": "server_error"}), 500),
+            (make_response(503, body=b"", reason="Service Unavailable"), 503),
+            (make_response(429, headers={"Retry-After": "1"}), 429),
+            (requests.ConnectionError("connection reset"), 0),
+            (requests.Timeout("read timed out"), 0),
+        ],
+        ids=["500", "503", "429", "connection-error", "timeout"],
+    )
+    def test_transient_refresh_failure_keeps_the_session(self, make_client, api, clock, token_path,
+                                                         failure, status):
+        client = make_client(expires_at=clock.now - 1)
+        api.on_token(failure)
+
+        with pytest.raises(SpotifyError) as exc:
+            client.get("/me")
+
+        assert exc.value.status == status
+        assert client.logged_in
+        assert json.loads(token_path.read_text())["refresh_token"] == "RT-1"
+
+    def test_session_kept_after_transient_failure_refreshes_on_next_request(self, make_client, api, clock):
+        client = make_client(expires_at=clock.now - 1)
+        api.on_token(make_response(503, body=b""),
+                     make_response(json_body={"access_token": "AT-2", "expires_in": 3600}))
+        api.on_get("/me", OK)
+
+        with pytest.raises(SpotifyError):
+            client.get("/me")
+        assert client.get("/me") == {"ok": True}
+
+        assert [c["data"]["refresh_token"] for c in api.calls_to("POST", TOKEN_URL)] == ["RT-1", "RT-1"]
+        assert bearer(api.calls_to("GET", "/me")[-1]) == "Bearer AT-2"
+
+    def test_network_error_during_refresh_is_a_spotify_error_not_a_requests_one(self, make_client, api, clock):
+        client = make_client(expires_at=clock.now - 1)
+        api.on_token(requests.ConnectionError("unreachable"))
+
+        with pytest.raises(SpotifyError, match="unreachable") as exc:
+            client.get("/me")
+
+        assert isinstance(exc.value.__cause__, requests.ConnectionError)
+        assert api.calls_to("GET", "/me") == []
+
+    def test_server_error_on_refresh_after_api_401_keeps_the_session(self, client, api, token_path):
+        api.on_get("/me", make_response(401, json_body={"error": {"status": 401, "message": "expired"}}))
+        api.on_token(make_response(502, body=b"", reason="Bad Gateway"))
+
+        with pytest.raises(SpotifyError) as exc:
+            client.get("/me")
+
+        assert exc.value.status == 502
+        assert client.logged_in
+        assert token_path.exists()
 
     def test_expired_token_without_refresh_token_logs_out_with_401(self, make_client, api, clock, token_path):
         client = make_client(expires_at=clock.now - 1, refresh_token=None)
@@ -241,6 +400,29 @@ class TestGetRetries:
         api.on_get("/me", make_response(429), OK)
         client.get("/me")
         assert clock.sleeps == [6]
+
+    def test_retry_after_at_the_cap_is_still_waited_out(self, client, api, clock):
+        api.on_get("/me", make_response(429, headers={"Retry-After": str(MAX_RETRY_AFTER)}), OK)
+
+        assert client.get("/me") == {"ok": True}
+        assert clock.sleeps == [MAX_RETRY_AFTER + 1]
+
+    @pytest.mark.parametrize(("retry_after", "minutes"), [(MAX_RETRY_AFTER + 1, 2), (3600, 61)],
+                             ids=["just-over-cap", "one-hour"])
+    def test_retry_after_over_the_cap_fails_fast_without_sleeping(self, client, api, clock, retry_after, minutes):
+        api.on_get("/me", make_response(429, headers={"Retry-After": str(retry_after)}), OK)
+
+        with pytest.raises(SpotifyError, match=f"za ok. {minutes} min") as exc:
+            client.get("/me")
+
+        assert exc.value.status == 429
+        assert clock.sleeps == []
+        assert len(api.calls) == 1
+
+    def test_negative_retry_after_is_treated_as_zero(self, client, api, clock):
+        api.on_get("/me", make_response(429, headers={"Retry-After": "-30"}), OK)
+        client.get("/me")
+        assert clock.sleeps == [1]
 
     def test_persistent_429_gives_up_after_max_retries(self, client, api):
         api.on_get("/me", make_response(429, headers={"Retry-After": "0"}))
@@ -323,6 +505,16 @@ class TestPaginate:
         assert [p["n"] for p in client.paginate("/me/playlists")] == [0, 1, 2, 3, 4]
         assert len(api.calls) == 3
         assert api.calls[0]["params"] == {"limit": PAGE_LIMIT}
+
+    def test_extra_params_go_on_the_first_page_only(self, client, api):
+        api.on_paged("/me/playlists", [{"n": i} for i in range(3)], page_size=2)
+
+        assert len(list(client.paginate("/me/playlists", {"additional_types": "track,episode"}))) == 3
+
+        first, second = api.calls
+        assert first["params"] == {"limit": PAGE_LIMIT, "additional_types": "track,episode"}
+        # the `next` URL already encodes every query parameter
+        assert second["params"] is None
 
     def test_empty_or_null_items_yield_nothing(self, client, api):
         api.on_get("/me/playlists", make_response(json_body={"items": None, "next": None}))

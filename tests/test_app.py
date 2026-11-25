@@ -17,6 +17,7 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
+import requests
 
 import app as app_module
 from app import App, ExportJob, load_dotenv, make_handler
@@ -156,6 +157,27 @@ class TestJsonOnlyPosts:
         assert status == 200
 
 
+class TestAntiFramingHeaders:
+    @pytest.mark.parametrize(
+        "send",
+        [
+            lambda s: s.get("/"),
+            lambda s: s.get("/api/status"),
+            lambda s: s.get("/nope"),
+            lambda s: s.get("/api/status", headers={"Host": "evil.example"}),
+            lambda s: s.get("/callback?error=access_denied"),
+            lambda s: s.request("POST", "/api/logout", body="{}", headers={"Content-Type": "text/plain"}),
+        ],
+        ids=["ui-page", "json-api", "not-found", "forbidden-host", "error-page", "unsupported-media"],
+    )
+    def test_every_rendered_response_refuses_framing_and_sniffing(self, server, send):
+        _, headers, _ = send(server)
+
+        assert headers["X-Frame-Options"] == "DENY"
+        assert headers["Content-Security-Policy"] == "frame-ancestors 'none'"
+        assert headers["X-Content-Type-Options"] == "nosniff"
+
+
 # --- pages and login flow -------------------------------------------------------------------
 
 class TestPagesAndLogin:
@@ -219,6 +241,31 @@ class TestPagesAndLogin:
         assert b"Code expired" in body
         assert not server.app.client.logged_in
 
+    def test_callback_shows_error_page_when_token_endpoint_is_unreachable(self, make_server, api, token_path):
+        server = make_server(logged_in=False)
+        api.on_token(requests.ConnectionError("dns failure"))
+        state = urllib.parse.parse_qs(urllib.parse.urlsplit(server.get("/login")[1]["Location"]).query)["state"][0]
+
+        status, headers, body = server.get(f"/callback?code=abc&state={state}")
+
+        assert status == 400
+        assert headers["Content-Type"].startswith("text/html")
+        assert "Błąd sieci".encode() in body
+        assert not token_path.exists()
+
+    @pytest.mark.xfail(strict=True, raises=(ConnectionError, http.client.HTTPException),
+                       reason="BUG: _request_token calls resp.json() unguarded; a 200 non-JSON body "
+                              "(captive portal, proxy page) escapes as requests.JSONDecodeError and the "
+                              "handler drops the connection instead of showing the error page")
+    def test_callback_shows_error_page_when_token_endpoint_returns_non_json(self, make_server, api):
+        server = make_server(logged_in=False)
+        api.on_token(make_response(body=b"<html>captive portal</html>", headers={"Content-Type": "text/html"}))
+        state = urllib.parse.parse_qs(urllib.parse.urlsplit(server.get("/login")[1]["Location"]).query)["state"][0]
+
+        status, _, _ = server.get(f"/callback?code=abc&state={state}")
+
+        assert status == 400
+
     def test_logout_ends_session(self, server, token_path):
         status, _, body = server.post_json("/api/logout", {})
 
@@ -250,6 +297,48 @@ class TestPlaylistsApi:
 
         assert status == 502
         assert json.loads(body)["error"] == "Spotify API 404: nope"
+
+    def test_unreachable_token_endpoint_during_refresh_is_502_and_keeps_session(self, make_client, out_root,
+                                                                              api, clock, token_path):
+        server = Server(App(make_client(expires_at=clock.now - 1), out_root, host="unset"))
+        api.on_token(requests.ConnectionError("connection reset"))
+        try:
+            status, _, body = server.get("/api/playlists")
+
+            assert status == 502
+            assert "Błąd sieci" in json.loads(body)["error"]
+            assert token_path.exists()
+            assert server.get("/")[0] == 200, "a network blip must not log the user out"
+        finally:
+            server.close()
+
+    def test_revoked_refresh_token_during_scan_logs_out(self, make_client, out_root, api, clock, token_path):
+        server = Server(App(make_client(expires_at=clock.now - 1), out_root, host="unset"))
+        api.on_token(make_response(400, json_body={"error": "invalid_grant", "error_description": "revoked"}))
+        try:
+            assert server.get("/api/playlists")[0] == 502
+            assert not token_path.exists()
+            assert server.get("/")[1]["Location"] == "/login"
+        finally:
+            server.close()
+
+    def test_long_rate_limit_answers_quickly_with_a_wait_hint(self, server, api, clock):
+        api.on_get("/me", make_response(429, headers={"Retry-After": "600"}))
+
+        status, _, body = server.get("/api/playlists")
+
+        assert status == 502
+        assert "11 min" in json.loads(body)["error"]
+        assert clock.sleeps == []
+
+    @pytest.mark.xfail(strict=True, raises=(ConnectionError, http.client.HTTPException),
+                       reason="BUG: SpotifyClient.get calls resp.json() outside its RequestException guard; "
+                              "a 200 non-JSON body escapes as requests.JSONDecodeError, which _api does not "
+                              "catch, so the handler drops the connection with no response")
+    def test_non_json_api_body_maps_to_502(self, server, api):
+        api.on_get("/me", make_response(body=b"<html>captive portal</html>", headers={"Content-Type": "text/html"}))
+
+        assert server.get("/api/playlists")[0] == 502
 
 
 # --- /api/export + /api/status --------------------------------------------------------------------
