@@ -506,6 +506,7 @@ class TestExportApi:
 # --- export destinations: folder vs ZIP download ------------------------------------------------
 
 RUN_STAMP = re.compile(r"\d{4}-\d{2}-\d{2}_\d{6}")
+NO_SUCH_USER = "no-such-user-spotify-export"  # `~NO_SUCH_USER` makes expanduser raise RuntimeError
 
 
 class TestExportDestination:
@@ -571,6 +572,30 @@ class TestExportDestination:
         assert library.calls_to("GET", "/playlists/own") == []
         assert not out_root.exists()
         assert not (tmp_path / "output").exists() and not (tmp_path / "elsewhere").exists()
+
+    # expanduser raises on these (RuntimeError / ValueError); unhandled, the
+    # handler thread died and the browser saw a dropped connection, not a 400.
+    @pytest.mark.parametrize("folder", [f"~{NO_SUCH_USER}/Eksporty", "~\x00/Eksporty", "~ja\x00n/Eksporty"],
+                             ids=["unknown-user", "nul-as-user", "nul-inside-user"])
+    def test_unexpandable_folder_is_400_and_starts_nothing(self, server, library, folder):
+        scan(server)
+
+        status, _, body = server.post_json("/api/export", {"ids": ["own"], "mode": "folder", "folder": folder})
+
+        assert (status, json.loads(body)) == (400, {"error": "Podaj pełną ścieżkę folderu."})
+        assert server.status()["items"] == []
+        assert library.calls_to("GET", "/playlists/own") == []
+
+    @pytest.mark.xfail(strict=True, reason="BUG: a NUL byte outside a ~user prefix passes validation; "
+                                           "the export thread then fails on mkdir instead of a 400")
+    def test_nul_byte_in_absolute_folder_is_400(self, server, library, tmp_path, monkeypatch):
+        monkeypatch.setattr(app_module.traceback, "print_exc", lambda: None)
+        scan(server)
+
+        status, _, _ = server.post_json("/api/export", {"ids": ["own"], "folder": f"{tmp_path}/a\x00b"})
+        server.wait_until_idle()
+
+        assert status == 400
 
 
 class TestDownloadMode:
@@ -786,6 +811,30 @@ class TestChooseFolderApi:
 
         assert fake.start_dir == str(tmp_path)
 
+    # The saved folder is only a start hint: one expanduser rejects falls back
+    # to the default instead of dropping the connection.
+    @pytest.mark.parametrize("current", [f"~{NO_SUCH_USER}/Muzyka", "~\x00/Muzyka"],
+                             ids=["unknown-user", "nul-as-user"])
+    def test_unexpandable_current_folder_starts_from_default(self, server, picker, on_macos,
+                                                             out_root, tmp_path, current):
+        out_root.mkdir()
+        fake = picker(stdout="/x\n")
+
+        status, _, body = server.post_json("/api/choose-folder", {"current": current})
+
+        assert (status, json.loads(body)) == (200, {"path": "/x"})
+        assert fake.start_dir == str(out_root)
+
+    def test_tilde_current_folder_starts_from_home(self, server, picker, on_macos, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        (home / "Muzyka").mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(home))
+        fake = picker(stdout="/x\n")
+
+        assert server.post_json("/api/choose-folder", {"current": "~/Muzyka"})[0] == 200
+
+        assert fake.start_dir == str(home / "Muzyka")
+
     def test_deleted_saved_folder_starts_from_its_nearest_existing_parent(self, server, picker, on_macos,
                                                                           tmp_path):
         fake = picker(stdout="/x\n")
@@ -874,6 +923,37 @@ class TestShutdownApi:
         finally:
             release.set()
         assert (status, json.loads(body)) == (200, {"ok": True})
+
+    @pytest.mark.parametrize("mode", ["folder", "download"])
+    def test_refused_while_an_export_runs_and_allowed_once_it_ends(self, server, library, scratch_dirs, mode):
+        # Stopping mid-run would leave a partial folder or an orphaned temp dir.
+        calls = []
+        server.app.request_shutdown = lambda: calls.append("stop")
+        release, entered = threading.Event(), threading.Event()
+        meta = make_response(json_body=playlist_meta("own", "Moja"))
+
+        def slow_meta():
+            entered.set()
+            release.wait(5)
+            return meta
+
+        library.on_get("/playlists/own", slow_meta)
+        scan(server)
+        try:
+            assert server.post_json("/api/export", {"ids": ["own"], "mode": mode})[0] == 202
+            assert entered.wait(5)
+
+            status, _, body = server.post_json("/api/shutdown", {})
+
+            assert status == 409
+            assert "Trwa eksport" in json.loads(body)["error"]
+            assert calls == []
+        finally:
+            release.set()
+
+        snap = server.wait_until_idle()
+        assert (snap["error"], snap["items"][0]["status"]) == (None, "done"), "the refused stop must not abort the run"
+        assert server.post_json("/api/shutdown", {})[0] == 200
 
     @pytest.mark.parametrize(
         "send",
