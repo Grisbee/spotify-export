@@ -2,3 +2,4 @@
 .token.json
 output/
 __pycache__/
+.pytest_cache/
