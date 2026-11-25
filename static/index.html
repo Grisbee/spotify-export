@@ -8,17 +8,21 @@
 <style>
   :root {
     --bg: #f6f6f4; --surface: #ffffff; --text: #1c1c1a; --muted: #6b6b66;
-    /* Green family shared with the app icon. */
-    --border: #e2e2dd; --accent: #168a5c; --accent-hover: #127a51; --accent-text: #ffffff;
-    --error: #b42318; --running: #9a6700; --done: #168a5c;
-    --control-border: #bfcac4; --selected: rgba(22, 138, 92, .08);
+    /* #1ED760, the same green as the app icon. It's too light for white
+       on top, so marks and button labels on it are black; small text on a
+       light background uses a darker shade of the same hue. */
+    --border: #e2e2dd; --accent: #1ed760; --accent-hover: #3be477; --accent-text: #000000;
+    --accent-ink: #128a3d;
+    --error: #b42318; --running: #9a6700; --done: #128a3d;
+    --control-border: #bfc8c2; --selected: rgba(30, 215, 96, .12);
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg: #141413; --surface: #1e1e1c; --text: #ececea; --muted: #9a9a94;
-      --border: #33332f; --accent: #3cc48a; --accent-hover: #52d29b; --accent-text: #08251a;
-      --error: #f97066; --running: #e3b341; --done: #3cc48a;
-      --control-border: #4f5a54; --selected: rgba(60, 196, 138, .12);
+      --border: #33332f; --accent: #1ed760; --accent-hover: #3be477; --accent-text: #000000;
+      --accent-ink: #1ed760;
+      --error: #f97066; --running: #e3b341; --done: #1ed760;
+      --control-border: #4f5a54; --selected: rgba(30, 215, 96, .10);
     }
   }
   * { box-sizing: border-box; }
@@ -35,7 +39,7 @@
   button:disabled { opacity: .5; cursor: default; }
   button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; }
   button.primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
-  button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  button:focus-visible, input:focus-visible { outline: 2px solid var(--accent-ink); outline-offset: 2px; }
   ul { list-style: none; margin: 0; padding: 0; background: var(--surface);
        border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
   li + li { border-top: 1px solid var(--border); }
@@ -57,7 +61,7 @@
     transition: border-color .15s, background-color .15s, transform .1s;
   }
   input[type=radio] { border-radius: 50%; }
-  input[type=checkbox]:hover:not(:disabled), input[type=radio]:hover:not(:disabled) { border-color: var(--accent); }
+  input[type=checkbox]:hover:not(:disabled), input[type=radio]:hover:not(:disabled) { border-color: var(--accent-ink); }
   input[type=checkbox]:active:not(:disabled), input[type=radio]:active:not(:disabled) { transform: scale(.92); }
   /* Solid fill with a matching border: a transparent border lets the
      background tile under it and draws a hard square edge. */
