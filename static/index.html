@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Eksport playlist Spotify</title>
+<style>
+  :root {
+    --bg: #f6f6f4; --surface: #ffffff; --text: #1c1c1a; --muted: #6b6b66;
+    --border: #e2e2dd; --accent: #1a7f4b; --accent-text: #ffffff;
+    --error: #b42318; --running: #9a6700;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #141413; --surface: #1e1e1c; --text: #ececea; --muted: #9a9a94;
+      --border: #33332f; --accent: #3fb873; --accent-text: #0d1a12;
+      --error: #f97066; --running: #e3b341;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 32px 16px 120px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 24px; }
+  .toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
+  input[type=search] { flex: 1 1 220px; padding: 8px 10px; border: 1px solid var(--border);
+         border-radius: 8px; background: var(--surface); color: var(--text); font: inherit; }
+  button { font: inherit; padding: 8px 14px; border-radius: 8px; border: 1px solid var(--border);
+           background: var(--surface); color: var(--text); cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  button.primary { background: var(--accent); color: var(--accent-text); border-color: transparent; font-weight: 600; }
+  ul { list-style: none; margin: 0; padding: 0; background: var(--surface);
+       border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+  li + li { border-top: 1px solid var(--border); }
+  label.row { display: flex; align-items: center; gap: 12px; padding: 10px 14px; cursor: pointer; }
+  .cover { width: 44px; height: 44px; border-radius: 6px; object-fit: cover; flex: none;
+           background: var(--border); display: grid; place-items: center; font-size: 20px; }
+  .meta { min-width: 0; flex: 1; }
+  .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .info { color: var(--muted); font-size: 13px; }
+  .status { font-size: 13px; color: var(--muted); white-space: nowrap; }
+  .status.done { color: var(--accent); } .status.error { color: var(--error); white-space: normal; }
+  .status.running { color: var(--running); }
+  input[type=checkbox] { width: 18px; height: 18px; accent-color: var(--accent); flex: none; }
+  footer { position: fixed; inset: auto 0 0 0; background: var(--surface); border-top: 1px solid var(--border); }
+  footer .inner { max-width: 760px; margin: 0 auto; padding: 12px 16px; display: flex;
+                  gap: 12px; align-items: center; justify-content: space-between; flex-wrap: wrap; }
+  .msg { padding: 14px; border-radius: 10px; background: var(--surface); border: 1px solid var(--border); margin-bottom: 16px; }
+  .msg.error { border-color: var(--error); color: var(--error); }
+  code { font-size: 13px; word-break: break-all; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Eksport playlist Spotify</h1>
+  <p class="sub">Zaznacz playlisty i kliknij „Eksportuj”. Każda zapisze się jako JSON razem z okładką.</p>
+  <div id="message"></div>
+  <div class="toolbar">
+    <input type="search" id="filter" placeholder="Szukaj playlisty…" disabled>
+    <button id="all" disabled>Zaznacz wszystkie</button>
+    <button id="none" disabled>Odznacz</button>
+    <button id="rescan" disabled>Odśwież</button>
+  </div>
+  <ul id="list"><li><div class="row" style="padding:14px">Skanuję playlisty…</div></li></ul>
+</main>
+<footer><div class="inner">
+  <span id="count">0 zaznaczonych</span>
+  <span>
+    <button id="logout">Wyloguj</button>
+    <button id="export" class="primary" disabled>Eksportuj</button>
+  </span>
+</div></footer>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let playlists = [];
+let polling = null;
+
+function plural(n) {
+  if (n === 1) return "utwór";
+  const d = n % 10, h = n % 100;
+  return d >= 2 && d <= 4 && (h < 12 || h > 14) ? "utwory" : "utworów";
+}
+
+function showMessage(html, isError = false) {
+  $("message").innerHTML = html ? `<div class="msg${isError ? " error" : ""}">${html}</div>` : "";
+}
+
+function escapeHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+}
+
+async function api(path, options) {
+  const res = await fetch(path, options);
+  const data = await res.json().catch(() => ({}));
+  if (res.status === 401) { location.href = "/login"; throw new Error("unauthorized"); }
+  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  return data;
+}
+
+function render() {
+  $("list").innerHTML = playlists.map((p) => {
+    const cover = p.kind === "liked_songs"
+      ? `<div class="cover">♥</div>`
+      : p.image ? `<img class="cover" src="${escapeHtml(p.image)}" alt="" loading="lazy">`
+      : `<div class="cover">♪</div>`;
+    const extra = p.collaborative ? " · współtworzona" : "";
+    return `<li data-name="${escapeHtml(p.name.toLowerCase())}">
+      <label class="row">
+        <input type="checkbox" value="${escapeHtml(p.id)}">
+        ${cover}
+        <span class="meta">
+          <div class="name">${escapeHtml(p.name)}</div>
+          <div class="info">${p.track_count} ${plural(p.track_count)}${extra}</div>
+        </span>
+        <span class="status" data-status="${escapeHtml(p.id)}"></span>
+      </label></li>`;
+  }).join("");
+  applyFilter();
+  updateCount();
+}
+
+function checkboxes() { return [...document.querySelectorAll("#list input[type=checkbox]")]; }
+function visible(cb) { return cb.closest("li").style.display !== "none"; }
+
+function updateCount() {
+  const n = checkboxes().filter((cb) => cb.checked).length;
+  $("count").textContent = `${n} zaznaczonych`;
+  $("export").disabled = n === 0 || polling !== null;
+}
+
+function applyFilter() {
+  const q = $("filter").value.trim().toLowerCase();
+  document.querySelectorAll("#list li").forEach((li) => {
+    li.style.display = !q || (li.dataset.name || "").includes(q) ? "" : "none";
+  });
+}
+
+function setControls(enabled) {
+  ["filter", "all", "none", "rescan"].forEach((id) => ($(id).disabled = !enabled));
+  checkboxes().forEach((cb) => (cb.disabled = !enabled));
+}
+
+async function scan() {
+  setControls(false);
+  showMessage("");
+  $("list").innerHTML = `<li><div class="row" style="padding:14px">Skanuję playlisty…</div></li>`;
+  try {
+    playlists = await api("/api/playlists");
+    render();
+    setControls(true);
+  } catch (e) {
+    if (e.message !== "unauthorized") showMessage(`Nie udało się pobrać listy: ${escapeHtml(e.message)}`, true);
+    $("rescan").disabled = false;
+  }
+}
+
+async function startExport() {
+  const ids = checkboxes().filter((cb) => cb.checked).map((cb) => cb.value);
+  document.querySelectorAll("[data-status]").forEach((el) => { el.textContent = ""; el.className = "status"; });
+  try {
+    await api("/api/export", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids }),
+    });
+  } catch (e) {
+    showMessage(escapeHtml(e.message), true);
+    return;
+  }
+  setControls(false);
+  showMessage("Eksportuję…");
+  polling = setInterval(poll, 700);
+  updateCount();
+  poll();
+}
+
+const STATUS_LABELS = { pending: "w kolejce", running: "pobieram…", done: "gotowe", error: "błąd" };
+
+async function poll() {
+  let job;
+  try { job = await api("/api/status"); } catch { return; }
+  for (const item of job.items) {
+    const el = document.querySelector(`[data-status="${CSS.escape(item.id)}"]`);
+    if (!el) continue;
+    el.className = `status ${item.status}`;
+    el.textContent = item.detail ? `${STATUS_LABELS[item.status]}: ${item.detail}` : STATUS_LABELS[item.status];
+  }
+  if (job.running) return;
+  clearInterval(polling);
+  polling = null;
+  setControls(true);
+  updateCount();
+  const failed = job.items.filter((i) => i.status === "error").length;
+  if (job.error) {
+    showMessage(`Eksport przerwany: ${escapeHtml(job.error)}`, true);
+  } else {
+    const note = failed ? ` ${failed} z błędem — szczegóły przy playlistach.` : "";
+    showMessage(`Gotowe.${note} Pliki zapisane w:<br><code>${escapeHtml(job.output_dir)}</code>`, failed > 0);
+  }
+}
+
+$("list").addEventListener("change", updateCount);
+$("filter").addEventListener("input", applyFilter);
+$("all").addEventListener("click", () => { checkboxes().filter(visible).forEach((cb) => (cb.checked = true)); updateCount(); });
+$("none").addEventListener("click", () => { checkboxes().filter(visible).forEach((cb) => (cb.checked = false)); updateCount(); });
+$("rescan").addEventListener("click", scan);
+$("export").addEventListener("click", startExport);
+$("logout").addEventListener("click", async () => {
+  await api("/api/logout", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+  location.href = "/login";
+});
+
+scan();
+</script>
+</body>
+</html>
