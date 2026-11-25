@@ -4,6 +4,8 @@ from __future__ import annotations
 import html
 import json
 import re
+import traceback
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -80,10 +82,14 @@ def export(
             (folder / "playlist.json").write_text(
                 json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8"
             )
-        except (SpotifyError, OSError, ValueError, KeyError) as exc:
-            message = str(exc)
+        except Exception as exc:  # one bad playlist must not abort the rest
             if isinstance(exc, SpotifyError) and exc.status == 403:
                 message = "Spotify nie udostępnia utworów tej playlisty (nie jesteś jej współtwórcą)."
+            elif isinstance(exc, (SpotifyError, OSError)):
+                message = str(exc)
+            else:
+                traceback.print_exc()
+                message = f"Nieoczekiwany błąd: {exc!r}"
             on_progress(entry["id"], "error", message)
             index.append({"id": entry["id"], "name": entry["name"], "error": message})
             continue
@@ -107,7 +113,11 @@ def _export_playlist(client: SpotifyClient, playlist_id: str, exported_at: datet
     p = client.get(f"/playlists/{playlist_id}")
     tracks = [
         _track(entry.get("item") or entry.get("track"), i, entry)
-        for i, entry in enumerate(client.paginate(f"/playlists/{playlist_id}/items"))
+        for i, entry in enumerate(client.paginate(
+            f"/playlists/{playlist_id}/items",
+            # Without it episodes come back reshaped as tracks.
+            {"additional_types": "track,episode"},
+        ))
     ]
     owner = p.get("owner") or {}
     return _document(exported_at, {
@@ -192,6 +202,9 @@ def _save_cover(client: SpotifyClient, entry: dict[str, Any], folder: Path) -> s
 
 
 def _best_image(images: list[dict[str, Any]] | None) -> str | None:
+    if not isinstance(images, list):
+        return None
+    images = [img for img in images if isinstance(img, dict) and img.get("url")]
     if not images:
         return None
     best = max(images, key=lambda img: (img.get("width") or 0) * (img.get("height") or 0))
@@ -226,11 +239,12 @@ def _tracks_label(n: int) -> str:
 
 
 def _unique_folder_name(name: str, used: set[str]) -> str:
-    base = re.sub(r'[\x00-\x1f/\\:*?"<>|]', "_", name).strip(" .") or "playlista"
-    base = base[:80]
+    # NFC first: macOS treats NFC and NFD spellings of a name as the same file.
+    base = unicodedata.normalize("NFC", re.sub(r'[\x00-\x1f/\\:*?"<>|]', "_", name))
+    base = base[:80].strip(" .") or "playlista"
     candidate, n = base, 2
-    while candidate.lower() in used:
+    while candidate.casefold() in used:
         candidate = f"{base} ({n})"
         n += 1
-    used.add(candidate.lower())
+    used.add(candidate.casefold())
     return candidate

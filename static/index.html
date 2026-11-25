@@ -213,7 +213,19 @@ $("logout").addEventListener("click", async () => {
   location.href = "/login";
 });
 
-scan();
+// Reloading mid-export: reattach to the running job instead of losing it.
+scan().then(async () => {
+  try {
+    const job = await api("/api/status");
+    if (job.running && polling === null) {
+      setControls(false);
+      showMessage("Eksportuję…");
+      polling = setInterval(poll, 700);
+      updateCount();
+      poll();
+    }
+  } catch {}
+});
 </script>
 </body>
 </html>

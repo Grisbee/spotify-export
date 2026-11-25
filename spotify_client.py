@@ -25,6 +25,7 @@ API_URL = "https://api.spotify.com/v1"
 SCOPES = "playlist-read-private playlist-read-collaborative user-library-read"
 PAGE_LIMIT = 50  # maximum allowed by every paginated endpoint used here
 TIMEOUT = (5, 30)  # (connect, read) seconds
+MAX_RETRY_AFTER = 60  # longer waits fail fast instead of freezing the UI
 MAX_RETRIES = 5
 
 
@@ -41,7 +42,7 @@ class SpotifyClient:
         self.token_path = token_path
         self._token: dict[str, Any] | None = self._load_token()
         self._pending_auth: dict[str, str] = {}  # state -> code_verifier
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()  # _refresh() calls logout() while holding it
         self._session = requests.Session()
 
     # --- auth -------------------------------------------------------------
@@ -91,12 +92,18 @@ class SpotifyClient:
                 "refresh_token": refresh_token,
                 "client_id": self.client_id,
             }, previous_refresh=refresh_token)
-        except SpotifyError:
-            self.logout()
+        except SpotifyError as exc:
+            # Only a definitive rejection ends the session; a 5xx, 429 or
+            # network hiccup must not throw away a still-valid refresh token.
+            if exc.status in (400, 401):
+                self.logout()
             raise
 
     def _request_token(self, data: dict[str, str], previous_refresh: str | None = None) -> None:
-        resp = self._session.post(TOKEN_URL, data=data, timeout=TIMEOUT)
+        try:
+            resp = self._session.post(TOKEN_URL, data=data, timeout=TIMEOUT)
+        except requests.RequestException as exc:
+            raise SpotifyError(0, f"Błąd sieci: {exc}") from exc
         if resp.status_code != 200:
             raise SpotifyError(resp.status_code, _error_message(resp))
         token = resp.json()
@@ -107,8 +114,10 @@ class SpotifyClient:
         self._save_token()
 
     def logout(self) -> None:
-        self._token = None
-        self.token_path.unlink(missing_ok=True)
+        # Under the lock so an in-flight refresh can't re-save the token afterwards.
+        with self._lock:
+            self._token = None
+            self.token_path.unlink(missing_ok=True)
 
     def _load_token(self) -> dict[str, Any] | None:
         try:
@@ -118,10 +127,15 @@ class SpotifyClient:
 
     def _save_token(self) -> None:
         # The file holds a long-lived refresh token, so keep it owner-only.
-        fd = os.open(self.token_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        os.fchmod(fd, 0o600)  # O_CREAT's mode doesn't apply to an existing file
+        # Written to a temp file and swapped in, so an interrupted write can't
+        # truncate it — a rotated refresh token can't be recovered.
+        tmp = self.token_path.with_name(self.token_path.name + ".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        if hasattr(os, "fchmod"):  # absent on Windows before Python 3.13
+            os.fchmod(fd, 0o600)  # O_CREAT's mode doesn't apply to an existing file
         with os.fdopen(fd, "w") as f:
             json.dump(self._token, f)
+        os.replace(tmp, self.token_path)
 
     def _access_token(self) -> str:
         with self._lock:
@@ -153,7 +167,10 @@ class SpotifyClient:
                 refreshed = True
                 continue
             if resp.status_code == 429:
-                time.sleep(_retry_after(resp) + 1)
+                wait = _retry_after(resp)
+                if wait > MAX_RETRY_AFTER:
+                    raise SpotifyError(429, f"Limit zapytań Spotify — spróbuj za ok. {wait // 60 + 1} min.")
+                time.sleep(wait + 1)
                 continue
             if resp.status_code >= 500 and attempt < MAX_RETRIES - 1:
                 time.sleep(2 ** attempt)
@@ -161,8 +178,9 @@ class SpotifyClient:
             raise SpotifyError(resp.status_code, _error_message(resp))
         raise SpotifyError(429, "Przekroczono limit zapytań — spróbuj później.")
 
-    def paginate(self, path: str) -> Iterator[dict[str, Any]]:
-        page: dict[str, Any] | None = self.get(path, {"limit": PAGE_LIMIT})
+    def paginate(self, path: str, params: dict[str, Any] | None = None) -> Iterator[dict[str, Any]]:
+        # `next` URLs already carry every query parameter, so params apply to page one only.
+        page: dict[str, Any] | None = self.get(path, {"limit": PAGE_LIMIT, **(params or {})})
         while page:
             yield from page.get("items") or []
             next_url = page.get("next")
