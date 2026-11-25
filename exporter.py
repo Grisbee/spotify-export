@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import html
+import io
 import json
 import re
 import traceback
 import unicodedata
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -107,6 +109,16 @@ def export(
         encoding="utf-8",
     )
     return run_dir
+
+
+def zip_dir(run_dir: Path) -> bytes:
+    """Pack a run directory into a ZIP whose top-level folder is the run's name."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for path in sorted(run_dir.rglob("*")):
+            if path.is_file():
+                zf.write(path, Path(run_dir.name) / path.relative_to(run_dir))
+    return buf.getvalue()
 
 
 def _export_playlist(client: SpotifyClient, playlist_id: str, exported_at: datetime) -> dict[str, Any]:

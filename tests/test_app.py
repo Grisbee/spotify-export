@@ -371,7 +371,8 @@ class TestExportApi:
         status, _, _ = server.post_json("/api/export", {"ids": ["followed", "someone-elses"]})
 
         assert status == 409
-        assert server.status() == {"running": False, "output_dir": None, "error": None, "items": []}
+        assert server.status() == {"running": False, "mode": "folder", "output_dir": None,
+                                   "download_ready": False, "error": None, "items": []}
         assert library.calls_to("GET", "/playlists/followed") == []
 
     def test_unknown_ids_are_dropped_from_a_valid_selection(self, server, library):
@@ -447,7 +448,8 @@ class TestExportJob:
 
         assert job.start([{"id": "b", "name": "B"}])
 
-        assert job.snapshot() == {"running": True, "output_dir": None, "error": None,
+        assert job.snapshot() == {"running": True, "mode": "folder", "output_dir": None,
+                                  "download_ready": False, "error": None,
                                   "items": [{"id": "b", "name": "B", "status": "pending", "detail": None}]}
 
     def test_unexpected_error_in_export_does_not_leave_job_running(self, client, out_root, monkeypatch):

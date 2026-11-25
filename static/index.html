@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Eksport playlist Spotify</title>
+<link rel="icon" href="/icon.png">
 <style>
   :root {
     --bg: #f6f6f4; --surface: #ffffff; --text: #1c1c1a; --muted: #6b6b66;
@@ -49,6 +50,12 @@
   .msg { padding: 14px; border-radius: 10px; background: var(--surface); border: 1px solid var(--border); margin-bottom: 16px; }
   .msg.error { border-color: var(--error); color: var(--error); }
   code { font-size: 13px; word-break: break-all; }
+  .dest { background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+          padding: 12px 14px; margin-bottom: 16px; display: grid; gap: 10px; }
+  .dest label { display: flex; align-items: center; gap: 10px; cursor: pointer; flex-wrap: wrap; }
+  .dest input[type=radio] { accent-color: var(--accent); width: 16px; height: 16px; margin: 0; }
+  .dest .path { color: var(--muted); font-size: 13px; word-break: break-all; flex: 1 1 200px; }
+  .dest button { padding: 4px 10px; font-size: 13px; }
 </style>
 </head>
 <body>
@@ -56,6 +63,13 @@
   <h1>Eksport playlist Spotify</h1>
   <p class="sub">Zaznacz playlisty i kliknij „Eksportuj”. Każda zapisze się jako JSON razem z okładką.</p>
   <div id="message"></div>
+  <div class="dest" role="radiogroup" aria-label="Miejsce zapisu">
+    <label><input type="radio" name="mode" value="folder" checked> Zapisz w folderze
+      <span class="path" id="folderPath"></span>
+      <button id="chooseFolder" type="button" hidden>Zmień…</button>
+    </label>
+    <label><input type="radio" name="mode" value="download"> Pobierz przez przeglądarkę (plik ZIP)</label>
+  </div>
   <div class="toolbar">
     <input type="search" id="filter" placeholder="Szukaj playlisty…" disabled>
     <button id="all" disabled>Zaznacz wszystkie</button>
@@ -67,6 +81,7 @@
 <footer><div class="inner">
   <span id="count">0 zaznaczonych</span>
   <span>
+    <button id="quit">Zakończ</button>
     <button id="logout">Wyloguj</button>
     <button id="export" class="primary" disabled>Eksportuj</button>
   </span>
@@ -76,6 +91,45 @@
 const $ = (id) => document.getElementById(id);
 let playlists = [];
 let polling = null;
+let downloadTriggered = false;
+let config = { default_folder: "", can_choose_folder: false };
+
+// Remembered per browser only; losing it just falls back to the defaults.
+const prefs = {
+  get(key) { try { return localStorage.getItem(key); } catch { return null; } },
+  set(key, value) { try { localStorage.setItem(key, value); } catch {} },
+};
+const mode = () => document.querySelector("input[name=mode]:checked").value;
+const folder = () => prefs.get("folder") || config.default_folder;
+
+async function loadConfig() {
+  try { config = await api("/api/config"); } catch {}
+  $("folderPath").textContent = folder();
+  $("chooseFolder").hidden = !config.can_choose_folder;
+  const saved = prefs.get("mode");
+  if (saved) document.querySelector(`input[name=mode][value="${saved}"]`)?.click();
+}
+
+async function chooseFolder(event) {
+  event.preventDefault();  // the button sits inside a label
+  $("chooseFolder").disabled = true;
+  try {
+    const res = await api("/api/choose-folder", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ current: folder() }),
+    });
+    if (res.path) {
+      prefs.set("folder", res.path);
+      $("folderPath").textContent = res.path;
+      document.querySelector('input[name=mode][value="folder"]').checked = true;
+      prefs.set("mode", "folder");
+    }
+  } catch (e) {
+    showMessage(escapeHtml(e.message), true);
+  } finally {
+    $("chooseFolder").disabled = false;
+  }
+}
 
 function plural(n) {
   if (n === 1) return "utwór";
@@ -139,7 +193,8 @@ function applyFilter() {
 }
 
 function setControls(enabled) {
-  ["filter", "all", "none", "rescan"].forEach((id) => ($(id).disabled = !enabled));
+  ["filter", "all", "none", "rescan", "chooseFolder", "quit"].forEach((id) => ($(id).disabled = !enabled));
+  document.querySelectorAll("input[name=mode]").forEach((r) => (r.disabled = !enabled));
   checkboxes().forEach((cb) => (cb.disabled = !enabled));
 }
 
@@ -159,12 +214,13 @@ async function scan() {
 
 async function startExport() {
   const ids = checkboxes().filter((cb) => cb.checked).map((cb) => cb.value);
+  downloadTriggered = false;
   document.querySelectorAll("[data-status]").forEach((el) => { el.textContent = ""; el.className = "status"; });
   try {
     await api("/api/export", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ids }),
+      body: JSON.stringify({ ids, mode: mode(), folder: mode() === "folder" ? folder() : null }),
     });
   } catch (e) {
     showMessage(escapeHtml(e.message), true);
@@ -196,13 +252,41 @@ async function poll() {
   const failed = job.items.filter((i) => i.status === "error").length;
   if (job.error) {
     showMessage(`Eksport przerwany: ${escapeHtml(job.error)}`, true);
+  } else if (job.mode === "download") {
+    const note = failed ? ` ${failed} z błędem — szczegóły przy playlistach.` : "";
+    showMessage(`Gotowe.${note} Pobieranie powinno ruszyć samo — jeśli nie, ` +
+      `<a href="/api/download" download>kliknij tutaj</a>.`, failed > 0);
+    if (job.download_ready) triggerDownload();
   } else {
     const note = failed ? ` ${failed} z błędem — szczegóły przy playlistach.` : "";
     showMessage(`Gotowe.${note} Pliki zapisane w:<br><code>${escapeHtml(job.output_dir)}</code>`, failed > 0);
   }
 }
 
+function triggerDownload() {
+  // poll() can see the same finished job more than once; download it once.
+  if (downloadTriggered) return;
+  downloadTriggered = true;
+  const a = document.createElement("a");
+  a.href = "/api/download";
+  a.download = "";
+  document.body.append(a);
+  a.click();
+  a.remove();
+}
+
 $("list").addEventListener("change", updateCount);
+document.querySelectorAll("input[name=mode]").forEach((r) =>
+  r.addEventListener("change", () => prefs.set("mode", mode())));
+$("chooseFolder").addEventListener("click", chooseFolder);
+$("quit").addEventListener("click", async () => {
+  try {
+    await api("/api/shutdown", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+  } catch {}
+  document.querySelector("main").innerHTML =
+    "<h1>Aplikacja zamknięta</h1><p class='sub'>Możesz zamknąć tę kartę. Uruchomisz ją ponownie ikonką lub <code>python3 app.py</code>.</p>";
+  document.querySelector("footer").remove();
+});
 $("filter").addEventListener("input", applyFilter);
 $("all").addEventListener("click", () => { checkboxes().filter(visible).forEach((cb) => (cb.checked = true)); updateCount(); });
 $("none").addEventListener("click", () => { checkboxes().filter(visible).forEach((cb) => (cb.checked = false)); updateCount(); });
@@ -214,6 +298,7 @@ $("logout").addEventListener("click", async () => {
 });
 
 // Reloading mid-export: reattach to the running job instead of losing it.
+loadConfig();
 scan().then(async () => {
   try {
     const job = await api("/api/status");

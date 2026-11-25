@@ -1,7 +1,8 @@
 """Local web UI for exporting Spotify playlists to JSON.
 
 Run `python3 app.py`, log in to Spotify in the browser tab that opens, tick the
-playlists to export and confirm. Files land in ./output/<timestamp>/.
+playlists to export and confirm. Each run is either saved to a folder
+(./output by default) or handed to the browser as a ZIP download.
 """
 from __future__ import annotations
 
@@ -9,7 +10,10 @@ import argparse
 import html
 import json
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 import traceback
 import urllib.parse
@@ -17,13 +21,15 @@ import webbrowser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import exporter
 from spotify_client import SpotifyClient, SpotifyError
 
 BASE_DIR = Path(__file__).resolve().parent
-INDEX_HTML = BASE_DIR / "static" / "index.html"
+STATIC_DIR = BASE_DIR / "static"
+INDEX_HTML = STATIC_DIR / "index.html"
+FOLDER_PICKER_TIMEOUT = 600  # seconds the macOS dialog may stay open
 
 
 class ExportJob:
@@ -35,14 +41,18 @@ class ExportJob:
         self.items: dict[str, dict[str, Any]] = {}
         self.output_dir: str | None = None
         self.error: str | None = None
+        self.mode = "folder"
+        self.download: tuple[str, bytes] | None = None  # (file name, ZIP bytes)
 
-    def start(self, entries: list[dict[str, Any]]) -> bool:
+    def start(self, entries: list[dict[str, Any]], mode: str = "folder") -> bool:
         with self.lock:
             if self.running:
                 return False
             self.running = True
+            self.mode = mode
             self.output_dir = None
             self.error = None
+            self.download = None
             self.items = {e["id"]: {"name": e["name"], "status": "pending", "detail": None}
                           for e in entries}
             return True
@@ -51,17 +61,21 @@ class ExportJob:
         with self.lock:
             self.items[item_id].update(status=status, detail=detail)
 
-    def finish(self, output_dir: Path | None, error: str | None = None) -> None:
+    def finish(self, output_dir: Path | None, error: str | None = None,
+               download: tuple[str, bytes] | None = None) -> None:
         with self.lock:
             self.running = False
             self.output_dir = str(output_dir) if output_dir else None
             self.error = error
+            self.download = download
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
             return {
                 "running": self.running,
+                "mode": self.mode,
                 "output_dir": self.output_dir,
+                "download_ready": self.download is not None,
                 "error": self.error,
                 "items": [{"id": k, **v} for k, v in self.items.items()],
             }
@@ -74,25 +88,28 @@ class App:
         self.out_root = out_root
         self.job = ExportJob()
         self.scanned: dict[str, dict[str, Any]] = {}
+        self.request_shutdown: Callable[[], None] = lambda: None  # set by main()
 
     def scan(self) -> list[dict[str, Any]]:
         entries = exporter.scan(self.client)
         self.scanned = {e["id"]: e for e in entries}
         return entries
 
-    def start_export(self, ids: list[str]) -> bool:
+    def start_export(self, ids: list[str], mode: str = "folder", folder: Path | None = None) -> bool:
         # Only ids from the last scan are accepted, so the UI can't request
         # playlists the user isn't allowed to read.
         unique_ids = dict.fromkeys(ids)  # drop repeats, keep the UI's order
         entries = [self.scanned[i] for i in unique_ids if i in self.scanned]
-        if not entries or not self.job.start(entries):
+        if not entries or not self.job.start(entries, mode):
             return False
-        threading.Thread(target=self._run_export, args=(entries,), daemon=True).start()
+        target = self._run_download if mode == "download" else self._run_export
+        args = (entries,) if mode == "download" else (entries, folder or self.out_root)
+        threading.Thread(target=target, args=args, daemon=True).start()
         return True
 
-    def _run_export(self, entries: list[dict[str, Any]]) -> None:
+    def _run_export(self, entries: list[dict[str, Any]], out_root: Path | None = None) -> None:
         try:
-            out = exporter.export(self.client, entries, self.out_root, self.job.progress)
+            out = exporter.export(self.client, entries, out_root or self.out_root, self.job.progress)
         except (SpotifyError, OSError) as exc:
             self.job.finish(None, str(exc))
         except Exception as exc:
@@ -102,6 +119,43 @@ class App:
             self.job.finish(None, f"Nieoczekiwany błąd: {exc!r}")
         else:
             self.job.finish(out)
+
+    def _run_download(self, entries: list[dict[str, Any]]) -> None:
+        # Exported into a scratch dir that is zipped and removed, so the
+        # download mode leaves nothing behind on disk.
+        tmp = Path(tempfile.mkdtemp(prefix="spotify-export-"))
+        try:
+            run_dir = exporter.export(self.client, entries, tmp, self.job.progress)
+            payload = (f"spotify-export_{run_dir.name}.zip", exporter.zip_dir(run_dir))
+        except (SpotifyError, OSError) as exc:
+            self.job.finish(None, str(exc))
+        except Exception as exc:
+            traceback.print_exc()
+            self.job.finish(None, f"Nieoczekiwany błąd: {exc!r}")
+        else:
+            self.job.finish(None, download=payload)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+def choose_folder(initial: Path) -> Path | None:
+    """Show the macOS folder picker; None when the user cancels."""
+    start = initial
+    while not start.is_dir() and start != start.parent:
+        start = start.parent
+    # The path goes in as an argument, never spliced into the script source.
+    script = """on run argv
+    activate
+    return POSIX path of (choose folder with prompt "Wybierz folder na eksport" ¬
+        default location (POSIX file (item 1 of argv)))
+end run"""
+    result = subprocess.run(["osascript", "-e", script, str(start)],
+                            capture_output=True, text=True, timeout=FOLDER_PICKER_TIMEOUT)
+    if result.returncode != 0:
+        if "-128" in result.stderr:  # "User canceled."
+            return None
+        raise OSError(result.stderr.strip() or "osascript failed")
+    return Path(result.stdout.strip())
 
 
 def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
@@ -131,6 +185,15 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
                 return self._api(app.scan)
             if url.path == "/api/status":
                 return self._json(HTTPStatus.OK, app.job.snapshot())
+            if url.path == "/api/config":
+                return self._json(HTTPStatus.OK, {
+                    "default_folder": str(app.out_root),
+                    "can_choose_folder": sys.platform == "darwin",
+                })
+            if url.path == "/api/download":
+                return self._download()
+            if url.path == "/icon.png":
+                return self._send(HTTPStatus.OK, (STATIC_DIR / "icon.png").read_bytes(), "image/png")
             self._send(HTTPStatus.NOT_FOUND, b"Not found", "text/plain")
 
         def do_POST(self) -> None:
@@ -147,13 +210,26 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
                 ids = body.get("ids") if isinstance(body, dict) else None
                 if not isinstance(ids, list) or not ids:
                     return self._json(HTTPStatus.BAD_REQUEST, {"error": "Nie wybrano playlist."})
-                if not app.start_export([str(i) for i in ids]):
+                mode = body.get("mode", "folder")
+                if mode not in ("folder", "download"):
+                    return self._json(HTTPStatus.BAD_REQUEST, {"error": "Nieznany tryb eksportu."})
+                folder = None
+                if mode == "folder" and body.get("folder"):
+                    folder = Path(str(body["folder"])).expanduser()
+                    if not folder.is_absolute():
+                        return self._json(HTTPStatus.BAD_REQUEST, {"error": "Podaj pełną ścieżkę folderu."})
+                if not app.start_export([str(i) for i in ids], mode, folder):
                     return self._json(HTTPStatus.CONFLICT,
                                       {"error": "Eksport już trwa albo wybór jest nieaktualny — odśwież listę."})
                 return self._json(HTTPStatus.ACCEPTED, {"ok": True})
             if path == "/api/logout":
                 app.client.logout()
                 return self._json(HTTPStatus.OK, {"ok": True})
+            if path == "/api/choose-folder":
+                return self._choose_folder()
+            if path == "/api/shutdown":
+                self._json(HTTPStatus.OK, {"ok": True})
+                return app.request_shutdown()
             self._json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
 
         def _callback(self, query: dict[str, list[str]]) -> None:
@@ -164,6 +240,28 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
             except SpotifyError as exc:
                 return self._error_page(str(exc))
             self._redirect("/")
+
+        def _choose_folder(self) -> None:
+            if sys.platform != "darwin":
+                return self._json(HTTPStatus.NOT_IMPLEMENTED, {"error": "Wybór folderu działa tylko na macOS."})
+            body = self._read_json()
+            initial = body.get("current") if isinstance(body, dict) else None
+            try:
+                chosen = choose_folder(Path(str(initial)) if initial else app.out_root)
+            except (OSError, subprocess.SubprocessError) as exc:
+                return self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"Nie udało się otworzyć okna: {exc}"})
+            self._json(HTTPStatus.OK, {"path": str(chosen) if chosen else None})
+
+        def _download(self) -> None:
+            with app.job.lock:
+                payload = app.job.download
+            if payload is None:
+                return self._json(HTTPStatus.NOT_FOUND, {"error": "Brak pliku do pobrania."})
+            name, data = payload
+            quoted = urllib.parse.quote(name)
+            self._send(HTTPStatus.OK, data, "application/zip", {
+                "Content-Disposition": f"attachment; filename=\"{quoted}\"; filename*=UTF-8''{quoted}",
+            })
 
         def _api(self, fn) -> None:
             try:
@@ -194,9 +292,12 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
         def _json(self, status: HTTPStatus, data: Any) -> None:
             self._send(status, json.dumps(data, ensure_ascii=False).encode(), "application/json")
 
-        def _send(self, status: HTTPStatus, body: bytes, content_type: str) -> None:
+        def _send(self, status: HTTPStatus, body: bytes, content_type: str,
+                  extra_headers: dict[str, str] | None = None) -> None:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
+            for key, value in (extra_headers or {}).items():
+                self.send_header(key, value)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             # Stops other sites from framing the UI and clickjacking its buttons.
@@ -242,7 +343,10 @@ def main() -> None:
     server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(app))
     url = f"http://127.0.0.1:{args.port}/"
     print(f"UI: {url}   (Redirect URI w Spotify Dashboard: {redirect_uri})")
-    print("Ctrl+C kończy pracę.")
+    print("Ctrl+C lub przycisk „Zakończ” na stronie kończy pracę.")
+    # shutdown() blocks until serve_forever() returns, so it can't run on
+    # the request thread that asked for it.
+    app.request_shutdown = lambda: threading.Thread(target=server.shutdown, daemon=True).start()
     if not args.no_browser:
         webbrowser.open(url)
     try:
