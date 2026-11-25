@@ -123,8 +123,10 @@ class App:
     def _run_download(self, entries: list[dict[str, Any]]) -> None:
         # Exported into a scratch dir that is zipped and removed, so the
         # download mode leaves nothing behind on disk.
-        tmp = Path(tempfile.mkdtemp(prefix="spotify-export-"))
+        tmp: Path | None = None
         try:
+            # Inside the try: a failing mkdtemp must still finish the job.
+            tmp = Path(tempfile.mkdtemp(prefix="spotify-export-"))
             run_dir = exporter.export(self.client, entries, tmp, self.job.progress)
             payload = (f"spotify-export_{run_dir.name}.zip", exporter.zip_dir(run_dir))
         except (SpotifyError, OSError) as exc:
@@ -135,7 +137,8 @@ class App:
         else:
             self.job.finish(None, download=payload)
         finally:
-            shutil.rmtree(tmp, ignore_errors=True)
+            if tmp is not None:
+                shutil.rmtree(tmp, ignore_errors=True)
 
 
 def choose_folder(initial: Path) -> Path | None:
@@ -247,7 +250,7 @@ def make_handler(app: App) -> type[BaseHTTPRequestHandler]:
             body = self._read_json()
             initial = body.get("current") if isinstance(body, dict) else None
             try:
-                chosen = choose_folder(Path(str(initial)) if initial else app.out_root)
+                chosen = choose_folder(Path(str(initial)).expanduser() if initial else app.out_root)
             except (OSError, subprocess.SubprocessError) as exc:
                 return self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"Nie udało się otworzyć okna: {exc}"})
             self._json(HTTPStatus.OK, {"path": str(chosen) if chosen else None})

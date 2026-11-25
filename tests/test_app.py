@@ -657,10 +657,6 @@ class TestDownloadMode:
         assert "unexpected payload" in snap["error"]
         assert len(scratch_dirs) == 1 and not scratch_dirs[0].exists()
 
-    @pytest.mark.xfail(strict=True, raises=AssertionError,
-                       reason="BUG: _run_download calls tempfile.mkdtemp before its try block; an OSError "
-                              "there (full disk, unwritable TMPDIR) kills the worker thread with the job "
-                              "still marked running, blocking every later export until restart")
     def test_temp_dir_creation_failure_does_not_leave_job_running(self, client, out_root, monkeypatch):
         def no_tmp(*args, **kwargs):
             raise OSError("Read-only file system")
